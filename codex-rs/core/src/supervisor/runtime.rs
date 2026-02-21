@@ -73,9 +73,9 @@ impl SupervisorRuntime {
 
         let mut notebook = self.notebook.lock().await;
         notebook.apply_after_agent_update(
-            format!("Reviewed Codex turn {turn_id}"),
+            format!("Reviewed gugugaga turn {turn_id}"),
             assistant_summary,
-            "Awaiting next Codex review".to_string(),
+            "Awaiting next gugugaga review".to_string(),
         );
         let summary = notebook.summary_line();
         let snapshot = notebook.clone();
@@ -262,7 +262,7 @@ mod tests {
         let stored = tokio::fs::read_to_string(notebook_path)
             .await
             .expect("read notebook");
-        assert!(stored.contains("Reviewed Codex turn turn-1"));
+        assert!(stored.contains("Reviewed gugugaga turn turn-1"));
     }
 
     #[tokio::test]
