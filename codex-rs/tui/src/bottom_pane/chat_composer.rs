@@ -137,6 +137,8 @@ use super::chat_composer_history::HistoryEntry;
 use super::command_popup::CommandItem;
 use super::command_popup::CommandPopup;
 use super::command_popup::CommandPopupFlags;
+use super::command_popup::CommandPopupMode;
+use super::command_popup::has_gugugaga_prefix;
 use super::file_search_popup::FileSearchPopup;
 use super::footer::CollaborationModeIndicator;
 use super::footer::FooterMode;
@@ -1163,6 +1165,7 @@ impl ChatComposer {
         let ActivePopup::Command(popup) = &mut self.active_popup else {
             unreachable!();
         };
+        let popup_mode = popup.mode();
 
         match key_event {
             KeyEvent {
@@ -1240,6 +1243,18 @@ impl ChatComposer {
                                 }
                             }
                         }
+                        CommandItem::Gugugaga(command_name) => {
+                            let starts_with_cmd = first_line
+                                .trim_start()
+                                .starts_with(&format!("//{command_name}"));
+                            if !starts_with_cmd {
+                                self.textarea
+                                    .set_text_clearing_elements(&format!("//{command_name} "));
+                            }
+                            if !self.textarea.text().is_empty() {
+                                cursor_target = Some(self.textarea.text().len());
+                            }
+                        }
                     }
                     if let Some(pos) = cursor_target {
                         self.textarea.set_cursor(pos);
@@ -1252,6 +1267,20 @@ impl ChatComposer {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
+                if popup_mode == CommandPopupMode::Gugugaga {
+                    if let Some(CommandItem::Gugugaga(command_name)) = popup.selected_item() {
+                        self.textarea.set_text_clearing_elements("");
+                        return (
+                            InputResult::Submitted {
+                                text: format!("//{command_name}"),
+                                text_elements: Vec::new(),
+                            },
+                            true,
+                        );
+                    }
+                    return self.handle_key_event_without_popup(key_event);
+                }
+
                 // If the current line starts with a custom prompt name and includes
                 // positional args for a numeric-style template, expand and submit
                 // immediately regardless of the popup selection.
@@ -1327,6 +1356,7 @@ impl ChatComposer {
                             }
                             return (InputResult::None, true);
                         }
+                        CommandItem::Gugugaga(_) => return (InputResult::None, true),
                     }
                 }
                 // Fallback to default newline handling if no command selected.
@@ -3075,6 +3105,28 @@ impl ChatComposer {
         Some((name, rest))
     }
 
+    /// If the cursor is currently within a `//name` command token on the first line,
+    /// extract the command name and the rest of the line after it.
+    fn gugugaga_command_under_cursor(first_line: &str, cursor: usize) -> Option<(&str, &str)> {
+        let stripped = first_line.strip_prefix("//")?;
+        let name_end_in_stripped = stripped
+            .find(char::is_whitespace)
+            .unwrap_or_else(|| stripped.len());
+        // `//` prefix is two bytes in ASCII.
+        let name_end = 2 + name_end_in_stripped;
+        if cursor > name_end {
+            return None;
+        }
+
+        let name = &stripped[..name_end_in_stripped];
+        let rest_start = stripped[name_end_in_stripped..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|idx| name_end_in_stripped + idx)
+            .unwrap_or(name_end_in_stripped);
+        let rest = &stripped[rest_start..];
+        Some((name, rest))
+    }
+
     /// Heuristic for whether the typed slash command looks like a valid
     /// prefix for any known command (built-in or custom prompt).
     /// Empty names only count when there is no extra content after the '/'.
@@ -3101,6 +3153,13 @@ impl ChatComposer {
         })
     }
 
+    fn looks_like_gugugaga_prefix(&self, name: &str, rest_after_name: &str) -> bool {
+        if name.is_empty() {
+            return rest_after_name.is_empty();
+        }
+        has_gugugaga_prefix(name)
+    }
+
     /// Synchronize `self.command_popup` with the current text in the
     /// textarea. This must be called after every modification that can change
     /// the text so the popup is shown/updated/hidden as appropriate.
@@ -3118,9 +3177,19 @@ impl ChatComposer {
         let cursor = self.textarea.cursor();
         let caret_on_first_line = cursor <= first_line_end;
 
-        let is_editing_slash_command_name = caret_on_first_line
-            && Self::slash_command_under_cursor(first_line, cursor)
-                .is_some_and(|(name, rest)| self.looks_like_slash_prefix(name, rest));
+        let editing_mode = if !caret_on_first_line {
+            None
+        } else if Self::gugugaga_command_under_cursor(first_line, cursor)
+            .is_some_and(|(name, rest)| self.looks_like_gugugaga_prefix(name, rest))
+        {
+            Some(CommandPopupMode::Gugugaga)
+        } else if Self::slash_command_under_cursor(first_line, cursor)
+            .is_some_and(|(name, rest)| self.looks_like_slash_prefix(name, rest))
+        {
+            Some(CommandPopupMode::Slash)
+        } else {
+            None
+        };
 
         // If the cursor is currently positioned within an `@token`, prefer the
         // file-search popup over the slash popup so users can insert a file path
@@ -3133,26 +3202,52 @@ impl ChatComposer {
         }
         match &mut self.active_popup {
             ActivePopup::Command(popup) => {
-                if is_editing_slash_command_name {
+                if let Some(mode) = editing_mode {
+                    if popup.mode() != mode {
+                        *popup = match mode {
+                            CommandPopupMode::Slash => {
+                                let collaboration_modes_enabled = self.collaboration_modes_enabled;
+                                let connectors_enabled = self.connectors_enabled;
+                                let personality_command_enabled = self.personality_command_enabled;
+                                CommandPopup::new(
+                                    self.custom_prompts.clone(),
+                                    CommandPopupFlags {
+                                        collaboration_modes_enabled,
+                                        connectors_enabled,
+                                        personality_command_enabled,
+                                        windows_degraded_sandbox_active: self
+                                            .windows_degraded_sandbox_active,
+                                    },
+                                )
+                            }
+                            CommandPopupMode::Gugugaga => CommandPopup::new_gugugaga(),
+                        };
+                    }
                     popup.on_composer_text_change(first_line.to_string());
                 } else {
                     self.active_popup = ActivePopup::None;
                 }
             }
             _ => {
-                if is_editing_slash_command_name {
-                    let collaboration_modes_enabled = self.collaboration_modes_enabled;
-                    let connectors_enabled = self.connectors_enabled;
-                    let personality_command_enabled = self.personality_command_enabled;
-                    let mut command_popup = CommandPopup::new(
-                        self.custom_prompts.clone(),
-                        CommandPopupFlags {
-                            collaboration_modes_enabled,
-                            connectors_enabled,
-                            personality_command_enabled,
-                            windows_degraded_sandbox_active: self.windows_degraded_sandbox_active,
-                        },
-                    );
+                if let Some(mode) = editing_mode {
+                    let mut command_popup = match mode {
+                        CommandPopupMode::Slash => {
+                            let collaboration_modes_enabled = self.collaboration_modes_enabled;
+                            let connectors_enabled = self.connectors_enabled;
+                            let personality_command_enabled = self.personality_command_enabled;
+                            CommandPopup::new(
+                                self.custom_prompts.clone(),
+                                CommandPopupFlags {
+                                    collaboration_modes_enabled,
+                                    connectors_enabled,
+                                    personality_command_enabled,
+                                    windows_degraded_sandbox_active: self
+                                        .windows_degraded_sandbox_active,
+                                },
+                            )
+                        }
+                        CommandPopupMode::Gugugaga => CommandPopup::new_gugugaga(),
+                    };
                     command_popup.on_composer_text_change(first_line.to_string());
                     self.active_popup = ActivePopup::Command(command_popup);
                 }
@@ -5455,6 +5550,9 @@ mod tests {
                 Some(CommandItem::UserPrompt(_)) => {
                     panic!("unexpected prompt selected for '/mo'")
                 }
+                Some(CommandItem::Gugugaga(_)) => {
+                    panic!("unexpected gugugaga command selected for '/mo'")
+                }
                 None => panic!("no selected command for '/mo'"),
             },
             _ => panic!("slash popup not active after typing '/mo'"),
@@ -5512,10 +5610,60 @@ mod tests {
                 Some(CommandItem::UserPrompt(_)) => {
                     panic!("unexpected prompt selected for '/res'")
                 }
+                Some(CommandItem::Gugugaga(_)) => {
+                    panic!("unexpected gugugaga command selected for '/res'")
+                }
                 None => panic!("no selected command for '/res'"),
             },
             _ => panic!("slash popup not active after typing '/res'"),
         }
+    }
+
+    #[test]
+    fn double_slash_popup_help_selected_for_bare_prefix() {
+        use super::super::command_popup::CommandItem;
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        type_chars_humanlike(&mut composer, &['/', '/']);
+
+        match &composer.active_popup {
+            ActivePopup::Command(popup) => {
+                assert_eq!(popup.mode(), CommandPopupMode::Gugugaga);
+                assert_eq!(popup.selected_item(), Some(CommandItem::Gugugaga("help")));
+            }
+            _ => panic!("gugugaga popup not active after typing '//'"),
+        }
+    }
+
+    #[test]
+    fn double_slash_enter_submits_selected_gugugaga_command() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        type_chars_humanlike(&mut composer, &['/', '/', 'm', 'o']);
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            result,
+            InputResult::Submitted {
+                text: "//model".to_string(),
+                text_elements: Vec::new(),
+            }
+        );
     }
 
     fn flush_after_paste_burst(composer: &mut ChatComposer) -> bool {

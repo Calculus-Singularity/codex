@@ -119,6 +119,68 @@ async fn test_config() -> Config {
         .expect("config")
 }
 
+#[test]
+fn parses_gugugaga_command_input() {
+    match parse_gugugaga_input("//help") {
+        Some(ParsedGugugagaInput::Command(GugugagaCommand::Help, args)) => {
+            assert!(args.is_empty());
+        }
+        other => panic!("unexpected parse result: {other:?}"),
+    }
+}
+
+#[test]
+fn parses_gugugaga_chat_input() {
+    match parse_gugugaga_input("// why did you stop this turn") {
+        Some(ParsedGugugagaInput::Chat(text)) => {
+            assert_eq!(text, "why did you stop this turn");
+        }
+        other => panic!("unexpected parse result: {other:?}"),
+    }
+}
+
+#[test]
+fn parses_empty_gugugaga_input_as_help_command() {
+    match parse_gugugaga_input("//") {
+        Some(ParsedGugugagaInput::Command(GugugagaCommand::Help, args)) => {
+            assert!(args.is_empty());
+        }
+        other => panic!("unexpected parse result: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn double_slash_chat_submits_supervisor_chat_op() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.bottom_pane.set_composer_text(
+        "// why did you stop this turn".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let mut chat_message = None;
+    loop {
+        match op_rx.try_recv() {
+            Ok(Op::SupervisorChat { message }) => {
+                chat_message = Some(message);
+                break;
+            }
+            Ok(_) => continue,
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => panic!("op channel disconnected"),
+        }
+    }
+
+    assert_eq!(
+        chat_message.as_deref(),
+        Some("why did you stop this turn"),
+        "expected // chat input to submit Op::SupervisorChat",
+    );
+}
+
 fn invalid_value(candidate: impl Into<String>, allowed: impl Into<String>) -> ConstraintError {
     ConstraintError::InvalidValue {
         field_name: "<unknown>",

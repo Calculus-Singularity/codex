@@ -196,6 +196,15 @@ pub enum Op {
         personality: Option<Personality>,
     },
 
+    /// Send a direct chat message to Gugugaga supervisor.
+    ///
+    /// This bypasses the normal Codex turn pipeline and asks the supervisor
+    /// agent to respond directly to the user.
+    SupervisorChat {
+        /// User message directed to Gugugaga (typically from `// ...` input).
+        message: String,
+    },
+
     /// Override parts of the persistent turn context for subsequent turns.
     ///
     /// All fields are optional; when omitted, the existing value is preserved.

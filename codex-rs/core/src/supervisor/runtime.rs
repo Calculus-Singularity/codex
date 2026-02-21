@@ -1,18 +1,135 @@
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use chrono::DateTime;
+use chrono::Utc;
 use codex_protocol::ThreadId;
+use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::protocol::BackgroundEventEvent;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandBeginEvent;
+use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use futures::StreamExt;
+use serde::Deserialize;
+use serde::Serialize;
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::warn;
+use wildmatch::WildMatch;
 
+use crate::client::ModelClient;
+use crate::client_common::Prompt;
+use crate::client_common::ResponseEvent;
+use crate::client_common::tools::ResponsesApiTool;
+use crate::client_common::tools::ToolSpec;
+use crate::codex::TurnContext;
 use crate::supervisor::notebook::SupervisorNotebook;
+use crate::tools::spec::AdditionalProperties;
+use crate::tools::spec::JsonSchema;
 
 const SUPERVISOR_ENV_VAR: &str = "GUGUGAGA_SUPERVISOR_ENABLED";
+const MAX_SUPERVISOR_FOLLOW_UP_ROUNDS: u32 = 8;
+const MAX_SUPERVISOR_TOOL_CALLS: usize = 24;
+const MAX_GLOB_VISITS: usize = 20_000;
+const TOOL_OUTPUT_LIMIT: usize = 4_000;
+const SUPERVISOR_STREAM_TIMEOUT: Duration = Duration::from_secs(45);
+const SUPERVISOR_BASE_INSTRUCTIONS: &str = "You are Gugugaga, the supervision agent for Codex. Prefer conservative decisions and JSON-only outputs.";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryTurn {
+    timestamp: DateTime<Utc>,
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct StructuredToolCall {
+    call_id: String,
+    tool_name: String,
+    arguments: String,
+    item: ResponseItem,
+}
+
+#[derive(Debug, Clone)]
+struct SupervisorDecision {
+    result: String,
+    summary: String,
+    violation_type: Option<String>,
+    description: Option<String>,
+    correction: Option<String>,
+}
+
+impl SupervisorDecision {
+    fn ok(summary: String) -> Self {
+        Self {
+            result: "ok".to_string(),
+            summary,
+            violation_type: None,
+            description: None,
+            correction: None,
+        }
+    }
+
+    fn warning_message(&self) -> Option<String> {
+        if !self.result.eq_ignore_ascii_case("violation") {
+            return None;
+        }
+
+        let violation_type = self
+            .violation_type
+            .as_deref()
+            .unwrap_or("UNSPECIFIED_VIOLATION");
+        let description = self
+            .description
+            .as_deref()
+            .unwrap_or(self.summary.as_str())
+            .trim();
+        let correction = self.correction.as_deref().unwrap_or("(none)").trim();
+
+        Some(format!(
+            "gugugaga supervisor violation {violation_type}: {description}. correction: {correction}"
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SupervisorPassResult {
+    decision: SupervisorDecision,
+    notebook_changed: bool,
+    ui_events: Vec<EventMsg>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NotebookSnapshot {
+    raw: String,
+}
+
+#[derive(Debug, Clone)]
+struct NotebookPatchHunk {
+    old_lines: Vec<String>,
+    new_lines: Vec<String>,
+}
+
+pub(crate) struct SupervisorAfterAgentOutcome {
+    pub(crate) warning_message: Option<String>,
+    pub(crate) events: Vec<EventMsg>,
+}
 
 pub(crate) struct SupervisorRuntime {
     enabled: bool,
     notebook_path: Option<PathBuf>,
+    history_archive_path: Option<PathBuf>,
     notebook: Mutex<SupervisorNotebook>,
     last_update_key: Mutex<Option<String>>,
 }
@@ -28,6 +145,7 @@ impl SupervisorRuntime {
             return Self {
                 enabled,
                 notebook_path: None,
+                history_archive_path: None,
                 notebook: Mutex::new(SupervisorNotebook::default()),
                 last_update_key: Mutex::new(None),
             };
@@ -37,11 +155,16 @@ impl SupervisorRuntime {
             .join("gugugaga")
             .join("notebooks")
             .join(format!("{conversation_id}.json"));
+        let history_archive_path = codex_home
+            .join("gugugaga")
+            .join("history")
+            .join(format!("{conversation_id}.jsonl"));
         let notebook = load_notebook(&notebook_path).await.unwrap_or_default();
 
         Self {
             enabled,
             notebook_path: Some(notebook_path),
+            history_archive_path: Some(history_archive_path),
             notebook: Mutex::new(notebook),
             last_update_key: Mutex::new(None),
         }
@@ -51,12 +174,26 @@ impl SupervisorRuntime {
         self.enabled
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn after_agent(
         &self,
         turn_id: &str,
         input_messages: &[String],
         last_assistant_message: Option<&str>,
     ) -> Option<String> {
+        self.after_agent_with_turn(turn_id, input_messages, last_assistant_message, None, None)
+            .await
+            .and_then(|outcome| outcome.warning_message)
+    }
+
+    pub(crate) async fn after_agent_with_turn(
+        &self,
+        turn_id: &str,
+        input_messages: &[String],
+        last_assistant_message: Option<&str>,
+        turn_context: Option<&TurnContext>,
+        model_client: Option<&ModelClient>,
+    ) -> Option<SupervisorAfterAgentOutcome> {
         if !self.enabled {
             return None;
         }
@@ -71,19 +208,142 @@ impl SupervisorRuntime {
         *last_update_key = Some(update_key);
         drop(last_update_key);
 
-        let mut notebook = self.notebook.lock().await;
-        notebook.apply_after_agent_update(
-            format!("Reviewed gugugaga turn {turn_id}"),
-            assistant_summary,
-            "Awaiting next gugugaga review".to_string(),
-        );
-        let summary = notebook.summary_line();
-        let snapshot = notebook.clone();
-        drop(notebook);
-        self.persist_notebook(&snapshot).await;
+        if let Some(user_message) = input_messages.last() {
+            self.append_history_turn("user", user_message).await;
+        }
+        if let Some(assistant_message) = last_assistant_message {
+            self.append_history_turn("codex", assistant_message).await;
+        }
 
+        let mut review_summary = assistant_summary;
+        let mut notebook_changed_by_tools = false;
+        let mut violation_note = None;
+        let mut ui_events = Vec::new();
+
+        if let (Some(tc), Some(client), Some(assistant_message)) =
+            (turn_context, model_client, last_assistant_message)
+        {
+            match self
+                .run_supervisor_pass(tc, client, input_messages, assistant_message)
+                .await
+            {
+                Ok(pass) => {
+                    review_summary = pass.decision.summary.clone();
+                    notebook_changed_by_tools = pass.notebook_changed;
+                    violation_note = pass.decision.warning_message();
+                    ui_events = pass.ui_events;
+                }
+                Err(err) => {
+                    warn!(
+                        turn_id = turn_id,
+                        error = %err,
+                        "supervisor structured follow-up failed; using fallback notebook update"
+                    );
+                }
+            }
+        }
+
+        if !notebook_changed_by_tools {
+            let mut notebook = self.notebook.lock().await;
+            notebook.apply_after_agent_update(
+                format!("Reviewed gugugaga turn {turn_id}"),
+                review_summary,
+                "Awaiting next gugugaga review".to_string(),
+            );
+            let snapshot = notebook.clone();
+            drop(notebook);
+            self.persist_notebook(&snapshot).await;
+        }
+
+        let warning_message = violation_note;
+
+        Some(SupervisorAfterAgentOutcome {
+            warning_message,
+            events: ui_events,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn search_history(&self, query: &str) -> Option<String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Some("search_history(\"\"): query is empty".to_string());
+        }
+        let turns = self.load_history_turns().await?;
+        let query_lower = query.to_ascii_lowercase();
+        let mut matches = Vec::new();
+        for turn in turns {
+            if turn.content.to_ascii_lowercase().contains(&query_lower) {
+                matches.push(turn);
+            }
+        }
+        if matches.is_empty() {
+            return Some(format!("search_history(\"{query}\"): No results"));
+        }
+        let mut lines = vec![format!(
+            "search_history(\"{query}\"): {} results",
+            matches.len()
+        )];
+        for (idx, turn) in matches.into_iter().take(10).enumerate() {
+            lines.push(format!(
+                "{}. [{} @ {}] {}",
+                idx + 1,
+                turn.role,
+                turn.timestamp.to_rfc3339(),
+                truncate_text(&turn.content, 240, "")
+            ));
+        }
+        Some(lines.join("\n"))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn read_recent(&self, count: usize) -> Option<String> {
+        let turns = self.load_history_turns().await?;
+        if turns.is_empty() {
+            return Some("read_recent: No history available".to_string());
+        }
+        let count = count.clamp(1, 20);
+        let start = turns.len().saturating_sub(count);
+        let mut lines = vec![format!(
+            "read_recent({count}): {} turns",
+            turns.len().saturating_sub(start)
+        )];
+        for turn in &turns[start..] {
+            lines.push(format!(
+                "[{} @ {}] {}",
+                turn.role,
+                turn.timestamp.to_rfc3339(),
+                turn.content
+            ));
+        }
+        Some(lines.join("\n"))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn read_turn(&self, index: usize) -> Option<String> {
+        let turns = self.load_history_turns().await?;
+        let Some(turn) = turns.get(index) else {
+            return Some(format!("read_turn({index}): Turn not found"));
+        };
         Some(format!(
-            "gugugaga supervisor updated notebook after turn review ({summary})."
+            "read_turn({index}): [{} @ {}]\n{}",
+            turn.role,
+            turn.timestamp.to_rfc3339(),
+            turn.content
+        ))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn history_stats(&self) -> Option<String> {
+        let turns = self.load_history_turns().await?;
+        let approx_tokens = turns
+            .iter()
+            .map(|turn| turn.content.len() / 4)
+            .sum::<usize>();
+        Some(format!(
+            "history_stats: {} total turns in archive ({} approx tokens)",
+            turns.len(),
+            approx_tokens
         ))
     }
 
@@ -105,14 +365,1008 @@ impl SupervisorRuntime {
 
         let mut notebook = self.notebook.lock().await;
         notebook.apply_request_user_input_update(turn_id, answer_groups, selected_answers);
-        let summary = notebook.summary_line();
+        let snapshot = notebook.clone();
+        drop(notebook);
+        self.persist_notebook(&snapshot).await;
+        None
+    }
+
+    pub(crate) async fn chat_with_user(
+        &self,
+        user_message: &str,
+        turn_context: &TurnContext,
+        model_client: &ModelClient,
+    ) -> Result<String, String> {
+        if !self.enabled {
+            return Err("supervisor is disabled".to_string());
+        }
+
+        let user_message = user_message.trim();
+        if user_message.is_empty() {
+            return Err("user message is empty".to_string());
+        }
+
+        let notebook_text = self.read_notebook_raw().await;
+        let history_excerpt = self.build_recent_history_excerpt(16).await;
+        let prompt_text = build_supervisor_chat_prompt(
+            user_message,
+            notebook_text.as_str(),
+            history_excerpt.as_str(),
+        );
+
+        let prompt = Prompt {
+            input: vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText { text: prompt_text }],
+                end_turn: None,
+                phase: None,
+            }],
+            tools: Vec::new(),
+            parallel_tool_calls: false,
+            base_instructions: BaseInstructions {
+                text: SUPERVISOR_BASE_INSTRUCTIONS.to_string(),
+            },
+            personality: None,
+            output_schema: None,
+        };
+
+        let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
+        let mut client_session = model_client.new_session();
+        let mut stream = tokio::time::timeout(
+            SUPERVISOR_STREAM_TIMEOUT,
+            client_session.stream(
+                &prompt,
+                &turn_context.model_info,
+                &turn_context.otel_manager,
+                Some(ReasoningEffortConfig::Low),
+                turn_context.reasoning_summary,
+                turn_metadata_header.as_deref(),
+            ),
+        )
+        .await
+        .map_err(|_| "supervisor chat stream start timed out".to_string())?
+        .map_err(|err| format!("supervisor chat stream setup failed: {err}"))?;
+
+        let mut response_text = String::new();
+        let mut completed = false;
+
+        loop {
+            let maybe_event = tokio::time::timeout(SUPERVISOR_STREAM_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| "supervisor chat stream timed out".to_string())?;
+            let Some(event) = maybe_event else {
+                break;
+            };
+
+            match event.map_err(|err| format!("supervisor chat stream error: {err}"))? {
+                ResponseEvent::OutputTextDelta(delta) => response_text.push_str(&delta),
+                ResponseEvent::OutputItemDone(item) => {
+                    if response_text.is_empty()
+                        && let Some(text) = extract_response_item_text(&item)
+                    {
+                        response_text.push_str(&text);
+                    }
+                }
+                ResponseEvent::Completed { .. } => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if !completed {
+            return Err("supervisor chat stream closed before completion".to_string());
+        }
+
+        let reply = truncate_text(
+            response_text.trim(),
+            4_000,
+            "I read your message but do not have a clear answer yet.",
+        );
+        self.append_history_turn("user_to_gugugaga", user_message)
+            .await;
+        self.append_history_turn("gugugaga", reply.as_str()).await;
+        Ok(reply)
+    }
+
+    async fn run_supervisor_pass(
+        &self,
+        turn_context: &TurnContext,
+        model_client: &ModelClient,
+        input_messages: &[String],
+        last_assistant_message: &str,
+    ) -> Result<SupervisorPassResult, String> {
+        if last_assistant_message.trim().is_empty() {
+            return Ok(SupervisorPassResult {
+                decision: SupervisorDecision::ok(
+                    "Codex produced no final text; keeping conservative OK.".to_string(),
+                ),
+                notebook_changed: false,
+                ui_events: Vec::new(),
+            });
+        }
+
+        let mut client_session = model_client.new_session();
+        let mut turn_items: Vec<ResponseItem> = Vec::new();
+        let mut executed_tool_signatures: HashSet<String> = HashSet::new();
+        let mut executed_tool_calls: usize = 0;
+        let mut notebook_changed = false;
+        let mut ui_events: Vec<EventMsg> = Vec::new();
+        let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
+
+        for round in 1..=MAX_SUPERVISOR_FOLLOW_UP_ROUNDS {
+            let round_message = if round == 1 {
+                "Supervising: Analyzing completed turn...".to_string()
+            } else {
+                format!("Supervising: Analyzing (tool follow-up #{})...", round - 1)
+            };
+            ui_events.push(EventMsg::BackgroundEvent(BackgroundEventEvent {
+                message: round_message,
+            }));
+
+            let notebook_text = self.read_notebook_raw().await;
+            let history_excerpt = self.build_recent_history_excerpt(12).await;
+            let prompt_text = build_supervisor_prompt(
+                input_messages,
+                last_assistant_message,
+                notebook_text.as_str(),
+                history_excerpt.as_str(),
+            );
+
+            let mut input = vec![ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText { text: prompt_text }],
+                end_turn: None,
+                phase: None,
+            }];
+            input.extend(turn_items.clone());
+
+            let prompt = Prompt {
+                input,
+                tools: supervisor_tools_schema(),
+                parallel_tool_calls: false,
+                base_instructions: BaseInstructions {
+                    text: SUPERVISOR_BASE_INSTRUCTIONS.to_string(),
+                },
+                personality: None,
+                output_schema: None,
+            };
+
+            let mut stream = tokio::time::timeout(
+                SUPERVISOR_STREAM_TIMEOUT,
+                client_session.stream(
+                    &prompt,
+                    &turn_context.model_info,
+                    &turn_context.otel_manager,
+                    Some(ReasoningEffortConfig::Low),
+                    turn_context.reasoning_summary,
+                    turn_metadata_header.as_deref(),
+                ),
+            )
+            .await
+            .map_err(|_| format!("supervisor stream start timed out in follow-up round {round}"))?
+            .map_err(|err| format!("supervisor stream setup failed: {err}"))?;
+
+            let mut response_text = String::new();
+            let mut output_items = Vec::new();
+            let mut completed = false;
+
+            loop {
+                let maybe_event = tokio::time::timeout(SUPERVISOR_STREAM_TIMEOUT, stream.next())
+                    .await
+                    .map_err(|_| {
+                        format!("supervisor stream timed out in follow-up round {round}")
+                    })?;
+
+                let Some(event) = maybe_event else {
+                    break;
+                };
+
+                match event.map_err(|err| format!("supervisor stream error: {err}"))? {
+                    ResponseEvent::OutputTextDelta(delta) => response_text.push_str(&delta),
+                    ResponseEvent::OutputItemDone(item) => {
+                        if response_text.is_empty()
+                            && let Some(text) = extract_response_item_text(&item)
+                        {
+                            response_text.push_str(&text);
+                        }
+                        output_items.push(item);
+                    }
+                    ResponseEvent::Completed { .. } => {
+                        completed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            if !completed {
+                return Err(format!(
+                    "supervisor stream closed before completion in follow-up round {round}"
+                ));
+            }
+
+            let tool_calls = extract_structured_tool_calls(&output_items);
+            if tool_calls.is_empty() {
+                let decision = parse_supervisor_decision(&response_text);
+                return Ok(SupervisorPassResult {
+                    decision,
+                    notebook_changed,
+                    ui_events,
+                });
+            }
+
+            for tool_call in tool_calls {
+                turn_items.push(tool_call.item.clone());
+                let signature = format!("{}::{}", tool_call.tool_name, tool_call.arguments);
+                let mut command = vec!["gugugaga/tool".to_string(), tool_call.tool_name.clone()];
+                let tool_call_id = format!("gugugaga-supervisor-{round}-{}", tool_call.call_id);
+                let turn_id = turn_context.sub_id.clone();
+                let cwd = turn_context.cwd.clone();
+
+                if !executed_tool_signatures.insert(signature) {
+                    let output = "duplicate tool call skipped in same turn".to_string();
+                    let args_preview = tool_args_preview(tool_call.arguments.as_str());
+                    if !args_preview.is_empty() {
+                        command.push(args_preview);
+                    }
+                    let parsed_cmd = vec![ParsedCommand::Unknown {
+                        cmd: command.join(" "),
+                    }];
+                    ui_events.push(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                        call_id: tool_call_id.clone(),
+                        process_id: None,
+                        turn_id: turn_id.clone(),
+                        command: command.clone(),
+                        cwd: cwd.clone(),
+                        parsed_cmd: parsed_cmd.clone(),
+                        source: ExecCommandSource::Agent,
+                        interaction_input: None,
+                    }));
+                    ui_events.push(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                        call_id: tool_call_id,
+                        process_id: None,
+                        turn_id,
+                        command,
+                        cwd,
+                        parsed_cmd,
+                        source: ExecCommandSource::Agent,
+                        interaction_input: None,
+                        stdout: String::new(),
+                        stderr: output.clone(),
+                        aggregated_output: output.clone(),
+                        exit_code: 1,
+                        duration: Duration::from_millis(0),
+                        formatted_output: output.clone(),
+                        status: ExecCommandStatus::Failed,
+                    }));
+                    turn_items.push(ResponseItem::FunctionCallOutput {
+                        call_id: tool_call.call_id,
+                        output: FunctionCallOutputPayload::from_text(output),
+                    });
+                    continue;
+                }
+
+                if executed_tool_calls >= MAX_SUPERVISOR_TOOL_CALLS {
+                    let output = "tool-call limit reached for this turn".to_string();
+                    let args_preview = tool_args_preview(tool_call.arguments.as_str());
+                    if !args_preview.is_empty() {
+                        command.push(args_preview);
+                    }
+                    let parsed_cmd = vec![ParsedCommand::Unknown {
+                        cmd: command.join(" "),
+                    }];
+                    ui_events.push(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                        call_id: tool_call_id.clone(),
+                        process_id: None,
+                        turn_id: turn_id.clone(),
+                        command: command.clone(),
+                        cwd: cwd.clone(),
+                        parsed_cmd: parsed_cmd.clone(),
+                        source: ExecCommandSource::Agent,
+                        interaction_input: None,
+                    }));
+                    ui_events.push(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                        call_id: tool_call_id,
+                        process_id: None,
+                        turn_id,
+                        command,
+                        cwd,
+                        parsed_cmd,
+                        source: ExecCommandSource::Agent,
+                        interaction_input: None,
+                        stdout: String::new(),
+                        stderr: output.clone(),
+                        aggregated_output: output.clone(),
+                        exit_code: 1,
+                        duration: Duration::from_millis(0),
+                        formatted_output: output.clone(),
+                        status: ExecCommandStatus::Failed,
+                    }));
+                    turn_items.push(ResponseItem::FunctionCallOutput {
+                        call_id: tool_call.call_id,
+                        output: FunctionCallOutputPayload::from_text(output),
+                    });
+                    continue;
+                }
+
+                executed_tool_calls += 1;
+                let started = std::time::Instant::now();
+                let (output, args_for_display, success, exit_code, status) =
+                    match Self::normalize_tool_arguments(
+                        tool_call.tool_name.as_str(),
+                        tool_call.arguments.as_str(),
+                    ) {
+                        Ok(normalized_args) => {
+                            let output = self
+                                .execute_tool_call(
+                                    tool_call.tool_name.as_str(),
+                                    normalized_args.as_str(),
+                                    turn_context.cwd.as_path(),
+                                )
+                                .await;
+                            (
+                                output,
+                                normalized_args,
+                                true,
+                                0,
+                                ExecCommandStatus::Completed,
+                            )
+                        }
+                        Err(err) => (
+                            format!("{}: Invalid arguments: {err}", tool_call.tool_name),
+                            tool_call.arguments.clone(),
+                            false,
+                            1,
+                            ExecCommandStatus::Failed,
+                        ),
+                    };
+                let duration = started.elapsed();
+
+                let args_preview = tool_args_preview(args_for_display.as_str());
+                if !args_preview.is_empty() {
+                    command.push(args_preview);
+                }
+                let parsed_cmd = vec![ParsedCommand::Unknown {
+                    cmd: command.join(" "),
+                }];
+                ui_events.push(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                    call_id: tool_call_id.clone(),
+                    process_id: None,
+                    turn_id: turn_id.clone(),
+                    command: command.clone(),
+                    cwd: cwd.clone(),
+                    parsed_cmd: parsed_cmd.clone(),
+                    source: ExecCommandSource::Agent,
+                    interaction_input: None,
+                }));
+                ui_events.push(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                    call_id: tool_call_id,
+                    process_id: None,
+                    turn_id,
+                    command,
+                    cwd,
+                    parsed_cmd,
+                    source: ExecCommandSource::Agent,
+                    interaction_input: None,
+                    stdout: if success {
+                        truncate_text(output.as_str(), TOOL_OUTPUT_LIMIT, "(no output)")
+                    } else {
+                        String::new()
+                    },
+                    stderr: if success {
+                        String::new()
+                    } else {
+                        truncate_text(output.as_str(), TOOL_OUTPUT_LIMIT, "")
+                    },
+                    aggregated_output: output.clone(),
+                    exit_code,
+                    duration,
+                    formatted_output: output.clone(),
+                    status,
+                }));
+
+                if tool_call.tool_name == "apply_patch_notebook"
+                    && output.contains("apply_patch_notebook: Applied")
+                {
+                    notebook_changed = true;
+                }
+
+                turn_items.push(ResponseItem::FunctionCallOutput {
+                    call_id: tool_call.call_id,
+                    output: FunctionCallOutputPayload::from_text(output),
+                });
+            }
+        }
+
+        Ok(SupervisorPassResult {
+            decision: SupervisorDecision::ok(
+                "Supervisor reached follow-up guard limit and returned conservative OK."
+                    .to_string(),
+            ),
+            notebook_changed,
+            ui_events,
+        })
+    }
+
+    fn normalize_tool_arguments(tool_name: &str, raw_args: &str) -> Result<String, String> {
+        let value: serde_json::Value = if raw_args.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(raw_args).map_err(|e| format!("invalid JSON: {e}"))?
+        };
+
+        let pick_str = |keys: &[&str]| -> Option<String> {
+            keys.iter().find_map(|key| {
+                value
+                    .get(*key)
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned)
+            })
+        };
+
+        let pick_usize = |keys: &[&str]| -> Option<usize> {
+            keys.iter().find_map(|key| {
+                value
+                    .get(*key)
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|n| n as usize)
+            })
+        };
+
+        match tool_name {
+            "search_history" => pick_str(&["query", "keyword", "text", "pattern"])
+                .ok_or_else(|| "missing query".to_string()),
+            "read_recent" => Ok(pick_usize(&["count", "n"]).unwrap_or(5).to_string()),
+            "read_turn" => pick_usize(&["index"])
+                .map(|v| v.to_string())
+                .ok_or_else(|| "missing index".to_string()),
+            "history_stats" | "read_notebook" => Ok(String::new()),
+            "apply_patch_notebook" => {
+                pick_str(&["patch"]).ok_or_else(|| "missing patch".to_string())
+            }
+            "read_file" => {
+                let path = pick_str(&["path"]).ok_or_else(|| "missing path".to_string())?;
+                let offset = pick_usize(&["offset"]).unwrap_or(1);
+                let limit = pick_usize(&["limit"]).unwrap_or(100);
+                if value.get("offset").is_some() || value.get("limit").is_some() {
+                    Ok(format!("{path}|{offset}|{limit}"))
+                } else {
+                    Ok(path)
+                }
+            }
+            "glob" => pick_str(&["pattern"]).ok_or_else(|| "missing pattern".to_string()),
+            "shell" => pick_str(&["cmd", "command"]).ok_or_else(|| "missing cmd".to_string()),
+            "rg" => pick_str(&["pattern"]).ok_or_else(|| "missing pattern".to_string()),
+            "ls" => pick_str(&["path"]).ok_or_else(|| "missing path".to_string()),
+            _ => {
+                if let Some(s) = value.as_str() {
+                    Ok(s.to_string())
+                } else {
+                    Ok(value.to_string())
+                }
+            }
+        }
+    }
+
+    async fn execute_tool_call(&self, tool_name: &str, args: &str, cwd: &Path) -> String {
+        match tool_name {
+            "search_history" => self
+                .search_history(args)
+                .await
+                .unwrap_or_else(|| format!("search_history(\"{args}\"): Search failed")),
+            "read_recent" => {
+                let n: usize = args.parse().unwrap_or(5).clamp(1, 20);
+                self.read_recent(n)
+                    .await
+                    .unwrap_or_else(|| format!("read_recent({n}): Error"))
+            }
+            "read_turn" => {
+                let index: usize = match args.parse() {
+                    Ok(i) => i,
+                    Err(_) => return format!("read_turn(\"{args}\"): Invalid index"),
+                };
+                self.read_turn(index)
+                    .await
+                    .unwrap_or_else(|| format!("read_turn({index}): Error"))
+            }
+            "history_stats" => self
+                .history_stats()
+                .await
+                .unwrap_or_else(|| "history_stats: Error".to_string()),
+            "read_notebook" => {
+                let content = self.read_notebook_raw().await;
+                if content.trim().is_empty() {
+                    "read_notebook: notebook is empty".to_string()
+                } else {
+                    format!("read_notebook:\n{content}")
+                }
+            }
+            "apply_patch_notebook" => self.handle_apply_patch_notebook(args).await,
+            "read_file" => {
+                let parts: Vec<&str> = args.splitn(3, '|').collect();
+                let path = parts.first().copied().unwrap_or_default().trim();
+                let offset = parts
+                    .get(1)
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .unwrap_or(1);
+                let limit = parts
+                    .get(2)
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .unwrap_or(100);
+
+                match Self::read_file_lines(cwd, path, offset, limit).await {
+                    Ok(content) => format!("read_file(\"{path}\", {offset}, {limit}):\n{content}"),
+                    Err(e) => format!("read_file(\"{path}\"): Error: {e}"),
+                }
+            }
+            "glob" => match Self::glob_files(cwd, args).await {
+                Ok(files) => {
+                    if files.is_empty() {
+                        format!("glob(\"{args}\"): No matches")
+                    } else {
+                        let display: Vec<String> = files
+                            .iter()
+                            .take(30)
+                            .map(|p| p.display().to_string())
+                            .collect();
+                        let suffix = if files.len() > 30 {
+                            format!("\n... and {} more", files.len() - 30)
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "glob(\"{args}\"): {} matches\n{}{}",
+                            files.len(),
+                            display.join("\n"),
+                            suffix
+                        )
+                    }
+                }
+                Err(e) => format!("glob(\"{args}\"): Error: {e}"),
+            },
+            "shell" | "rg" | "grep" => {
+                let cmd = if tool_name == "rg" || tool_name == "grep" {
+                    format!("rg {args}")
+                } else {
+                    args.to_string()
+                };
+
+                match Self::execute_shell(cwd, &cmd).await {
+                    Ok(output) => format!("shell(\"{cmd}\"):\n{output}"),
+                    Err(e) => format!("shell(\"{cmd}\"): Error: {e}"),
+                }
+            }
+            "ls" => {
+                let cmd = format!("ls -la {args}");
+                match Self::execute_shell(cwd, &cmd).await {
+                    Ok(output) => format!("ls(\"{args}\"):\n{output}"),
+                    Err(e) => format!("ls(\"{args}\"): Error: {e}"),
+                }
+            }
+            _ => format!("Unknown tool: {tool_name}"),
+        }
+    }
+
+    async fn read_file_lines(
+        cwd: &Path,
+        path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<String, String> {
+        if path.trim().is_empty() {
+            return Err("empty path".to_string());
+        }
+
+        let resolved_path = resolve_path(cwd, path);
+        let content = tokio::fs::read_to_string(&resolved_path)
+            .await
+            .map_err(|e| format!("Failed to read file: {e}"))?;
+
+        let lines: Vec<&str> = content.lines().collect();
+        let safe_limit = limit.clamp(1, 500);
+        let start = offset.saturating_sub(1).min(lines.len());
+        let end = (start + safe_limit).min(lines.len());
+
+        let result: Vec<String> = lines[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("L{}: {}", start + i + 1, line))
+            .collect();
+
+        Ok(result.join("\n"))
+    }
+
+    async fn glob_files(cwd: &Path, pattern: &str) -> Result<Vec<PathBuf>, String> {
+        let cwd = cwd.to_path_buf();
+        let pattern = pattern.trim().to_string();
+        tokio::task::spawn_blocking(move || glob_files_blocking(&cwd, &pattern))
+            .await
+            .map_err(|e| format!("glob worker failed: {e}"))?
+    }
+
+    async fn execute_shell(cwd: &Path, cmd: &str) -> Result<String, String> {
+        let parts = shlex::split(cmd).ok_or_else(|| "failed to parse command".to_string())?;
+        if parts.is_empty() {
+            return Err("empty command".to_string());
+        }
+
+        let program = std::path::Path::new(parts[0].as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(parts[0].as_str());
+
+        if !Self::is_safe_command(program, &parts) {
+            return Err(format!("Command '{program}' is not in the safe whitelist"));
+        }
+
+        let output = Command::new("sh")
+            .arg("-lc")
+            .arg(cmd)
+            .current_dir(cwd)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        let mut result = String::new();
+
+        if !stdout.is_empty() {
+            result.push_str(&truncate_text(&stdout, TOOL_OUTPUT_LIMIT, "(no output)"));
+        }
+
+        if !stderr.is_empty() {
+            if !result.is_empty() {
+                result.push_str("\n[stderr]\n");
+            }
+            result.push_str(&truncate_text(&stderr, TOOL_OUTPUT_LIMIT, ""));
+        }
+
+        if result.trim().is_empty() {
+            result = "(no output)".to_string();
+        }
+
+        Ok(result)
+    }
+
+    fn is_safe_command(program: &str, args: &[String]) -> bool {
+        match program {
+            "cat" | "cd" | "cut" | "echo" | "expr" | "false" | "grep" | "head" | "id" | "ls"
+            | "nl" | "paste" | "pwd" | "rev" | "seq" | "stat" | "tail" | "tr" | "true"
+            | "uname" | "uniq" | "wc" | "which" | "whoami" => true,
+            "numfmt" | "tac" => cfg!(target_os = "linux"),
+            "base64" => !args.iter().any(|arg| {
+                arg == "--output" || arg.starts_with("--output=") || arg.starts_with("-o")
+            }),
+            "find" => {
+                let unsafe_opts = [
+                    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0",
+                    "-fprintf",
+                ];
+                !args.iter().any(|arg| unsafe_opts.contains(&arg.as_str()))
+            }
+            "rg" => !args.iter().any(|arg| {
+                arg == "--search-zip"
+                    || arg == "-z"
+                    || arg == "--pre"
+                    || arg.starts_with("--pre=")
+                    || arg == "--hostname-bin"
+                    || arg.starts_with("--hostname-bin=")
+            }),
+            "git" => matches!(
+                args.get(1).map(String::as_str),
+                Some("branch") | Some("status") | Some("log") | Some("diff") | Some("show")
+            ),
+            "cargo" => matches!(args.get(1).map(String::as_str), Some("check")),
+            "sed" => {
+                args.len() <= 4
+                    && args.get(1).map(String::as_str) == Some("-n")
+                    && args.get(2).is_some_and(|arg| {
+                        arg.ends_with('p')
+                            && arg
+                                .trim_end_matches('p')
+                                .chars()
+                                .all(|c| c.is_ascii_digit() || c == ',')
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    async fn handle_apply_patch_notebook(&self, patch: &str) -> String {
+        let patch = patch.trim();
+        if patch.is_empty() {
+            return "apply_patch_notebook: patch is empty".to_string();
+        }
+
+        let hunks = match Self::parse_apply_patch_hunks(patch) {
+            Ok(hunks) => hunks,
+            Err(err) => return format!("apply_patch_notebook: Invalid patch format: {err}"),
+        };
+
+        let mut notebook = self.notebook.lock().await;
+        let original = match serde_json::to_string_pretty(&*notebook) {
+            Ok(content) => content,
+            Err(err) => return format!("apply_patch_notebook: Failed to read notebook: {err}"),
+        };
+
+        let (updated, applied_hunks) = match Self::apply_patch_hunks(&original, &hunks) {
+            Ok(result) => result,
+            Err(err) => return format!("apply_patch_notebook: {err}"),
+        };
+
+        if updated == original {
+            return "apply_patch_notebook: No changes applied".to_string();
+        }
+
+        let mut parsed: SupervisorNotebook = match serde_json::from_str(&updated) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return format!(
+                    "apply_patch_notebook: Patch result is not valid notebook JSON: {err}"
+                );
+            }
+        };
+
+        parsed.last_updated = Some(Utc::now());
+        *notebook = parsed;
         let snapshot = notebook.clone();
         drop(notebook);
         self.persist_notebook(&snapshot).await;
 
-        Some(format!(
-            "gugugaga supervisor recorded request_user_input response ({summary})."
-        ))
+        let diff = Self::build_notebook_diff(
+            &NotebookSnapshot {
+                raw: original.clone(),
+            },
+            &NotebookSnapshot { raw: updated },
+        );
+
+        match diff {
+            Some(unified_diff) => {
+                format!("apply_patch_notebook: Applied {applied_hunks} hunk(s)\n{unified_diff}")
+            }
+            None => format!("apply_patch_notebook: Applied {applied_hunks} hunk(s)"),
+        }
+    }
+
+    fn parse_apply_patch_hunks(patch: &str) -> Result<Vec<NotebookPatchHunk>, String> {
+        let lines: Vec<&str> = patch.lines().collect();
+        if lines.first() != Some(&"*** Begin Patch") {
+            return Err("missing '*** Begin Patch' header".to_string());
+        }
+        if lines.last() != Some(&"*** End Patch") {
+            return Err("missing '*** End Patch' footer".to_string());
+        }
+
+        let mut index = 1usize;
+        let mut saw_update_file = false;
+        let mut hunks = Vec::new();
+
+        while index + 1 < lines.len() {
+            let line = lines[index];
+            if line.starts_with("*** Update File:") {
+                saw_update_file = true;
+                index += 1;
+                continue;
+            }
+            if line.starts_with("*** Add File:")
+                || line.starts_with("*** Delete File:")
+                || line.starts_with("*** Move to:")
+            {
+                return Err("only '*** Update File:' patches are supported".to_string());
+            }
+            if line.starts_with("@@") {
+                index += 1;
+                let mut old_lines = Vec::new();
+                let mut new_lines = Vec::new();
+
+                while index + 1 < lines.len() {
+                    let hunk_line = lines[index];
+                    if hunk_line.starts_with("@@")
+                        || hunk_line.starts_with("*** Update File:")
+                        || hunk_line == "*** End Patch"
+                    {
+                        break;
+                    }
+                    if hunk_line == "*** End of File" || hunk_line == r"\ No newline at end of file"
+                    {
+                        index += 1;
+                        continue;
+                    }
+                    if hunk_line.is_empty() {
+                        return Err(
+                            "empty hunk line must include prefix (' ', '+', '-')".to_string()
+                        );
+                    }
+
+                    let (prefix, body) = hunk_line.split_at(1);
+                    match prefix {
+                        " " => {
+                            old_lines.push(body.to_string());
+                            new_lines.push(body.to_string());
+                        }
+                        "-" => old_lines.push(body.to_string()),
+                        "+" => new_lines.push(body.to_string()),
+                        _ => {
+                            return Err(format!("unsupported hunk line prefix: '{hunk_line}'"));
+                        }
+                    }
+                    index += 1;
+                }
+
+                if old_lines.is_empty() && new_lines.is_empty() {
+                    return Err("empty hunk body".to_string());
+                }
+                hunks.push(NotebookPatchHunk {
+                    old_lines,
+                    new_lines,
+                });
+                continue;
+            }
+
+            if line.trim().is_empty() {
+                index += 1;
+                continue;
+            }
+
+            return Err(format!("unexpected patch line: '{line}'"));
+        }
+
+        if !saw_update_file {
+            return Err("missing '*** Update File:' section".to_string());
+        }
+        if hunks.is_empty() {
+            return Err("patch does not contain any hunks".to_string());
+        }
+
+        Ok(hunks)
+    }
+
+    fn apply_patch_hunks(
+        original: &str,
+        hunks: &[NotebookPatchHunk],
+    ) -> Result<(String, usize), String> {
+        let mut lines: Vec<String> = original.lines().map(ToOwned::to_owned).collect();
+        let trailing_newline = original.ends_with('\n');
+        let mut search_start = 0usize;
+
+        for (idx, hunk) in hunks.iter().enumerate() {
+            if hunk.old_lines.is_empty() {
+                let insert_at = search_start.min(lines.len());
+                lines.splice(insert_at..insert_at, hunk.new_lines.clone());
+                search_start = insert_at + hunk.new_lines.len();
+                continue;
+            }
+
+            let Some(start) = Self::find_hunk_start(&lines, &hunk.old_lines, search_start)
+                .or_else(|| Self::find_hunk_start(&lines, &hunk.old_lines, 0))
+            else {
+                return Err(format!(
+                    "failed to apply hunk {}: target block not found",
+                    idx + 1
+                ));
+            };
+
+            let end = start + hunk.old_lines.len();
+            lines.splice(start..end, hunk.new_lines.clone());
+            search_start = start + hunk.new_lines.len();
+        }
+
+        let mut merged = lines.join("\n");
+        if trailing_newline && !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+
+        Ok((merged, hunks.len()))
+    }
+
+    fn find_hunk_start(lines: &[String], needle: &[String], from: usize) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(from.min(lines.len()));
+        }
+        if lines.len() < needle.len() || from > lines.len().saturating_sub(needle.len()) {
+            return None;
+        }
+
+        (from..=lines.len() - needle.len()).find(|&start| {
+            lines[start..start + needle.len()]
+                .iter()
+                .map(String::as_str)
+                .eq(needle.iter().map(String::as_str))
+        })
+    }
+
+    fn build_notebook_diff(before: &NotebookSnapshot, after: &NotebookSnapshot) -> Option<String> {
+        if before.raw == after.raw {
+            return None;
+        }
+
+        let before_lines: Vec<&str> = before.raw.lines().collect();
+        let after_lines: Vec<&str> = after.raw.lines().collect();
+        Some(Self::build_unified_diff(&before_lines, &after_lines))
+    }
+
+    fn build_unified_diff(before_lines: &[&str], after_lines: &[&str]) -> String {
+        let mut prefix = 0usize;
+        while prefix < before_lines.len()
+            && prefix < after_lines.len()
+            && before_lines[prefix] == after_lines[prefix]
+        {
+            prefix += 1;
+        }
+
+        let mut suffix = 0usize;
+        while suffix < before_lines.len().saturating_sub(prefix)
+            && suffix < after_lines.len().saturating_sub(prefix)
+            && before_lines[before_lines.len() - 1 - suffix]
+                == after_lines[after_lines.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+
+        let old_end = before_lines.len().saturating_sub(suffix);
+        let new_end = after_lines.len().saturating_sub(suffix);
+        let removed = &before_lines[prefix..old_end];
+        let added = &after_lines[prefix..new_end];
+        let old_start = prefix + 1;
+        let new_start = prefix + 1;
+
+        let mut out = format!(
+            "@@ -{},{} +{},{} @@",
+            old_start,
+            removed.len(),
+            new_start,
+            added.len()
+        );
+
+        for line in removed {
+            out.push('\n');
+            out.push('-');
+            out.push_str(line);
+        }
+        for line in added {
+            out.push('\n');
+            out.push('+');
+            out.push_str(line);
+        }
+
+        out
+    }
+
+    async fn read_notebook_raw(&self) -> String {
+        let notebook = self.notebook.lock().await;
+        serde_json::to_string_pretty(&*notebook).unwrap_or_default()
+    }
+
+    async fn build_recent_history_excerpt(&self, count: usize) -> String {
+        let Some(turns) = self.load_history_turns().await else {
+            return "(history unavailable)".to_string();
+        };
+
+        if turns.is_empty() {
+            return "(no history yet)".to_string();
+        }
+
+        let start = turns.len().saturating_sub(count.max(1));
+        turns[start..]
+            .iter()
+            .enumerate()
+            .map(|(offset, turn)| {
+                format!(
+                    "#{} [{} @ {}] {}",
+                    start + offset,
+                    turn.role,
+                    turn.timestamp.to_rfc3339(),
+                    truncate_text(turn.content.as_str(), 320, "")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n---\n")
     }
 
     async fn persist_notebook(&self, notebook: &SupervisorNotebook) {
@@ -150,6 +1404,492 @@ impl SupervisorRuntime {
             }
         }
     }
+
+    async fn append_history_turn(&self, role: &str, content: &str) {
+        let Some(path) = self.history_archive_path.as_ref() else {
+            return;
+        };
+
+        if content.trim().is_empty() {
+            return;
+        }
+
+        if let Some(parent) = path.parent()
+            && let Err(err) = tokio::fs::create_dir_all(parent).await
+        {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to create supervisor history parent directory"
+            );
+            return;
+        }
+
+        let turn = HistoryTurn {
+            timestamp: Utc::now(),
+            role: role.to_string(),
+            content: content.to_string(),
+        };
+
+        let line = match serde_json::to_string(&turn) {
+            Ok(line) => line,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to serialize supervisor history turn"
+                );
+                return;
+            }
+        };
+
+        let mut payload = line;
+        payload.push('\n');
+        let mut file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await
+        {
+            Ok(file) => file,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to open supervisor history archive"
+                );
+                return;
+            }
+        };
+
+        use tokio::io::AsyncWriteExt;
+        if let Err(err) = file.write_all(payload.as_bytes()).await {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to append supervisor history"
+            );
+        }
+    }
+
+    async fn load_history_turns(&self) -> Option<Vec<HistoryTurn>> {
+        let path = self.history_archive_path.as_ref()?;
+        let raw = match tokio::fs::read_to_string(path).await {
+            Ok(raw) => raw,
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    return Some(Vec::new());
+                }
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to read supervisor history archive"
+                );
+                return None;
+            }
+        };
+
+        let mut turns = Vec::new();
+        for line in raw.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<HistoryTurn>(line) {
+                Ok(turn) => turns.push(turn),
+                Err(err) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "failed to parse supervisor history line; skipping"
+                    );
+                }
+            }
+        }
+        Some(turns)
+    }
+}
+
+fn supervisor_tools_schema() -> Vec<ToolSpec> {
+    fn function_tool(
+        name: &str,
+        description: &str,
+        properties: BTreeMap<String, JsonSchema>,
+        required: &[&str],
+    ) -> ToolSpec {
+        ToolSpec::Function(ResponsesApiTool {
+            name: name.to_string(),
+            description: description.to_string(),
+            strict: false,
+            parameters: JsonSchema::Object {
+                properties,
+                required: (!required.is_empty())
+                    .then(|| required.iter().map(ToString::to_string).collect()),
+                additional_properties: Some(AdditionalProperties::Boolean(false)),
+            },
+        })
+    }
+
+    fn string_property(description: &str) -> JsonSchema {
+        JsonSchema::String {
+            description: Some(description.to_string()),
+        }
+    }
+
+    fn integer_property(description: &str) -> JsonSchema {
+        JsonSchema::Number {
+            description: Some(description.to_string()),
+        }
+    }
+
+    vec![
+        function_tool(
+            "read_notebook",
+            "Read full notebook file content before analysis or edits.",
+            BTreeMap::new(),
+            &[],
+        ),
+        function_tool(
+            "apply_patch_notebook",
+            "Apply an apply_patch-style patch to the notebook file.",
+            BTreeMap::from([(
+                "patch".to_string(),
+                string_property("Patch text using *** Begin Patch / *** End Patch format."),
+            )]),
+            &["patch"],
+        ),
+        function_tool(
+            "search_history",
+            "Search archived conversation history by keyword.",
+            BTreeMap::from([(
+                "query".to_string(),
+                string_property("Keyword query for archived turns."),
+            )]),
+            &["query"],
+        ),
+        function_tool(
+            "read_recent",
+            "Read recent conversation turns.",
+            BTreeMap::from([(
+                "count".to_string(),
+                integer_property("Number of recent turns to read."),
+            )]),
+            &[],
+        ),
+        function_tool(
+            "read_turn",
+            "Read one conversation turn by index.",
+            BTreeMap::from([(
+                "index".to_string(),
+                integer_property("0-based turn index in archive."),
+            )]),
+            &["index"],
+        ),
+        function_tool(
+            "history_stats",
+            "Get history and token stats.",
+            BTreeMap::new(),
+            &[],
+        ),
+        function_tool(
+            "read_file",
+            "Read file content by path and optional line window.",
+            BTreeMap::from([
+                (
+                    "path".to_string(),
+                    string_property("File path relative to workspace cwd or absolute path."),
+                ),
+                (
+                    "offset".to_string(),
+                    integer_property("1-based line offset."),
+                ),
+                ("limit".to_string(), integer_property("Max lines to read.")),
+            ]),
+            &["path"],
+        ),
+        function_tool(
+            "glob",
+            "List files matching a glob pattern.",
+            BTreeMap::from([(
+                "pattern".to_string(),
+                string_property("Glob pattern like *.rs or src/**/*.ts."),
+            )]),
+            &["pattern"],
+        ),
+        function_tool(
+            "shell",
+            "Execute a read-only shell command in safety whitelist.",
+            BTreeMap::from([("cmd".to_string(), string_property("Shell command to run."))]),
+            &["cmd"],
+        ),
+        function_tool(
+            "rg",
+            "Search files via ripgrep pattern.",
+            BTreeMap::from([(
+                "pattern".to_string(),
+                string_property("Ripgrep search pattern."),
+            )]),
+            &["pattern"],
+        ),
+        function_tool(
+            "ls",
+            "List directory entries.",
+            BTreeMap::from([(
+                "path".to_string(),
+                string_property("Directory path to list."),
+            )]),
+            &["path"],
+        ),
+    ]
+}
+
+fn build_supervisor_prompt(
+    input_messages: &[String],
+    last_assistant_message: &str,
+    notebook_text: &str,
+    history_excerpt: &str,
+) -> String {
+    let latest_user_message = input_messages
+        .last()
+        .map(String::as_str)
+        .unwrap_or("(no user message captured)");
+
+    format!(
+        r#"You are Gugugaga, the supervision agent for Codex. You have your own notebook and long-term memory.
+
+=== Your Notebook File (Persistent) ===
+{notebook_text}
+
+=== Persistent Memory (Recent History) ===
+{history_excerpt}
+
+=== Current Turn ===
+User:
+{latest_user_message}
+
+Codex Output:
+{last_assistant_message}
+
+Default stance:
+- Assume Codex is doing fine unless there is clear evidence of a violation.
+- Most turns should return "ok" (Codex completes tasks, explains results, writes code).
+- If confidence is low, prefer "ok".
+
+Your duties (in priority order):
+1. Judge if behavior is reasonable **given the user's specific instructions and preferences**
+2. If you see a clear violation with high confidence, provide correction
+3. Before deciding, read notebook content with `read_notebook`.
+4. Keep notebook updates high-signal: write only durable information that
+   improves future decisions (new progress, a new risk/attention item, or a
+   correction lesson), and avoid near-duplicate entries unless something
+   materially changed.
+5. Minimal action principle: if current turn content is already sufficient, do not call tools.
+
+Available tools (structured function calls, use when needed):
+
+Notebook:
+- read_notebook
+- apply_patch_notebook
+
+History:
+- search_history
+- read_recent
+- read_turn
+- history_stats
+
+File verification (read-only):
+- read_file
+- glob
+- shell
+- rg
+- ls
+
+=== Normal behavior (do not flag) ===
+- Codex completing a task and summarizing what it did ("Done! I created X with features Y and Z")
+- Codex writing code with reasonable features (error handling, input validation, comments)
+- Codex explaining how to use something it just built
+- Codex listing files, reading context, then acting — this is good practice
+- Codex responding with a plan or explanation when the user asked a question
+- Adding standard best practices (e.g. error handling for a calculator) — this is not over-engineering
+
+=== Violations (flag only when clearly present) ===
+- FALLBACK: Codex refuses the task ("can't do it", "let's simplify", "skip for now") instead of trying to complete it.
+- IGNORED_INSTRUCTION: Codex does the opposite of an explicit user instruction (for example, user asked for Python but Codex used JavaScript).
+- UNNECESSARY_INTERACTION: Codex pauses mid-task to ask permission or narrate, and the user explicitly asked for autonomous execution ("just do it", "don't ask", "work autonomously", "finish before talking to me"). Both conditions must hold. If the task is already complete, summarizing results is normal. If the user gave no such instruction, narration is normal.
+- OVER_ENGINEERING: Codex adds architectural complexity the user did not ask for (for example, introducing a full caching layer, adding redundant fallback systems, or refactoring an entire module for a narrow fix). Standard robustness work (error handling, input validation, clean structure) is not over-engineering.
+- UNAUTHORIZED_CHANGE: Codex changes unrelated behavior not requested by user.
+
+Decision threshold: high confidence only.
+- If Codex completed what the user asked, even with extra explanation or features, that is OK.
+- Avoid nitpicking. Summarizing completed work is normal behavior, not unnecessary interaction.
+- For straightforward requests (confirmations, short Q&A, obvious edits), default to no tool calls.
+
+Final response format:
+- If tool calls are used, continue until tool outputs are incorporated.
+- Return exactly one final JSON object (no extra text).
+
+If no violation (this should be your answer ~90% of the time):
+{{"result": "ok", "summary": "What Codex did, one sentence"}}
+
+If violation found (only when you are highly confident):
+{{"result": "violation", "type": "VIOLATION_TYPE", "description": "What went wrong specifically", "correction": "Specific instruction to fix it"}}
+
+Valid violation types: FALLBACK, IGNORED_INSTRUCTION, UNAUTHORIZED_CHANGE, UNNECESSARY_INTERACTION, OVER_ENGINEERING
+
+Final answer must be JSON only, with no extra text before or after."#
+    )
+}
+
+fn build_supervisor_chat_prompt(
+    user_message: &str,
+    notebook_text: &str,
+    history_excerpt: &str,
+) -> String {
+    format!(
+        r#"You are Gugugaga, an AI supervision agent that monitors another AI (Codex).
+You have full access to the conversation history and your personal notebook.
+
+=== Your Notebook File (Persistent) ===
+{notebook_text}
+
+=== Persistent Memory (Recent History) ===
+{history_excerpt}
+
+The user is speaking to you directly. Answer helpfully, concisely, and in the
+same language the user used. You can:
+- Explain your past supervision decisions
+- Discuss the current task and Codex's behavior
+- Share observations from your notebook
+- Answer questions about the codebase (based on what you've seen)
+- Be explicit when you are uncertain
+
+User message:
+{user_message}"#
+    )
+}
+
+fn extract_structured_tool_calls(items: &[ResponseItem]) -> Vec<StructuredToolCall> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            } => Some(StructuredToolCall {
+                call_id: call_id.clone(),
+                tool_name: name.clone(),
+                arguments: arguments.clone(),
+                item: item.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn extract_response_item_text(item: &ResponseItem) -> Option<String> {
+    let ResponseItem::Message { content, .. } = item else {
+        return None;
+    };
+
+    let mut pieces = Vec::new();
+    for part in content {
+        match part {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                if !text.trim().is_empty() {
+                    pieces.push(text.as_str());
+                }
+            }
+            ContentItem::InputImage { .. } => {}
+        }
+    }
+
+    if pieces.is_empty() {
+        None
+    } else {
+        Some(pieces.join("\n"))
+    }
+}
+
+fn parse_supervisor_decision(response: &str) -> SupervisorDecision {
+    #[derive(Debug, Deserialize)]
+    struct ParsedDecision {
+        result: Option<String>,
+        summary: Option<String>,
+        #[serde(rename = "type")]
+        violation_type: Option<String>,
+        description: Option<String>,
+        correction: Option<String>,
+    }
+
+    let candidate = extract_first_json_object(response).unwrap_or_else(|| response.to_string());
+    if let Ok(parsed) = serde_json::from_str::<ParsedDecision>(&candidate) {
+        let result = parsed.result.unwrap_or_else(|| "ok".to_string());
+        let summary = parsed
+            .summary
+            .or_else(|| parsed.description.clone())
+            .unwrap_or_else(|| {
+                truncate_text(
+                    response.trim(),
+                    220,
+                    "Supervisor returned no summary; defaulting to conservative OK.",
+                )
+            });
+        return SupervisorDecision {
+            result,
+            summary,
+            violation_type: parsed.violation_type,
+            description: parsed.description,
+            correction: parsed.correction,
+        };
+    }
+
+    SupervisorDecision::ok(truncate_text(
+        response.trim(),
+        220,
+        "Supervisor returned no parseable JSON; defaulting to conservative OK.",
+    ))
+}
+
+fn extract_first_json_object(text: &str) -> Option<String> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for (start_idx, start_char) in &chars {
+        if *start_char != '{' {
+            continue;
+        }
+
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escape = false;
+
+        for (idx, ch) in chars.iter().copied().skip_while(|(idx, _)| idx < start_idx) {
+            if in_string {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escape = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(text[*start_idx..idx + ch.len_utf8()].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 async fn load_notebook(path: &Path) -> Option<SupervisorNotebook> {
@@ -179,6 +1919,65 @@ async fn load_notebook(path: &Path) -> Option<SupervisorNotebook> {
             None
         }
     }
+}
+
+fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    }
+}
+
+fn glob_files_blocking(cwd: &Path, pattern: &str) -> Result<Vec<PathBuf>, String> {
+    if pattern.trim().is_empty() {
+        return Err("empty pattern".to_string());
+    }
+
+    let matcher = WildMatch::new(pattern);
+    let pattern_no_slash = !pattern.contains('/');
+    let mut stack = vec![cwd.to_path_buf()];
+    let mut matches = Vec::new();
+    let mut visited = 0usize;
+
+    while let Some(dir) = stack.pop() {
+        let read_dir = std::fs::read_dir(&dir).map_err(|e| format!("read_dir failed: {e}"))?;
+        for entry in read_dir {
+            let entry = entry.map_err(|e| format!("read_dir entry failed: {e}"))?;
+            let path = entry.path();
+            visited += 1;
+            if visited > MAX_GLOB_VISITS {
+                return Err(format!(
+                    "glob scan exceeded {MAX_GLOB_VISITS} filesystem entries"
+                ));
+            }
+
+            let rel = path.strip_prefix(cwd).unwrap_or(path.as_path());
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let abs_str = path.to_string_lossy().replace('\\', "/");
+
+            let filename_match = pattern_no_slash
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| matcher.matches(name));
+
+            if matcher.matches(rel_str.as_str())
+                || matcher.matches(abs_str.as_str())
+                || filename_match
+            {
+                matches.push(path.clone());
+            }
+
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+
+    matches.sort();
+    Ok(matches)
 }
 
 fn summarize_user_message(user_message: Option<&String>) -> String {
@@ -213,16 +2012,19 @@ fn truncate_text(input: &str, limit: usize, fallback: &str) -> String {
     output
 }
 
+fn tool_args_preview(args: &str) -> String {
+    let compact = args.trim().replace('\n', "\\n");
+    truncate_text(compact.as_str(), 180, "")
+}
+
 fn supervisor_enabled_from_env() -> bool {
-    std::env::var(SUPERVISOR_ENV_VAR)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    match std::env::var(SUPERVISOR_ENV_VAR) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -247,10 +2049,10 @@ mod tests {
         let conversation_id = ThreadId::default();
         let runtime = SupervisorRuntime::new(dir.path(), conversation_id, true).await;
 
-        let event = runtime
+        let warning = runtime
             .after_agent("turn-1", &[String::from("hello")], Some("world"))
             .await;
-        assert!(event.is_some());
+        assert_eq!(warning, None);
 
         let notebook_path = dir
             .path()
@@ -273,16 +2075,158 @@ mod tests {
         let first = runtime
             .after_agent("turn-1", &[String::from("hello")], Some("world"))
             .await;
+        let completed_after_first = {
+            let notebook = runtime.notebook.lock().await;
+            notebook.completed.len()
+        };
         let second = runtime
             .after_agent("turn-1", &[String::from("hello")], Some("world"))
             .await;
+        let completed_after_second = {
+            let notebook = runtime.notebook.lock().await;
+            notebook.completed.len()
+        };
 
-        assert!(first.is_some());
+        assert_eq!(first, None);
         assert_eq!(second, None);
+        assert_eq!(completed_after_first, 1);
+        assert_eq!(completed_after_second, 1);
     }
 
     #[test]
     fn truncate_text_returns_fallback_for_empty_input() {
         assert_eq!(truncate_text("", 20, "fallback"), "fallback");
+    }
+
+    #[test]
+    fn normalize_tool_arguments_maps_apply_patch_notebook() {
+        let normalized = SupervisorRuntime::normalize_tool_arguments(
+            "apply_patch_notebook",
+            r#"{"patch":"*** Begin Patch\n*** Update File: notebook\n@@\n-a\n+b\n*** End Patch"}"#,
+        )
+        .expect("should normalize");
+        assert!(normalized.contains("*** Begin Patch"));
+    }
+
+    #[test]
+    fn normalize_tool_arguments_maps_read_file_window() {
+        let normalized = SupervisorRuntime::normalize_tool_arguments(
+            "read_file",
+            r#"{"path":"src/main.rs","offset":5,"limit":10}"#,
+        )
+        .expect("should normalize");
+        assert_eq!(normalized, "src/main.rs|5|10");
+    }
+
+    #[test]
+    fn normalize_tool_arguments_maps_read_notebook_without_args() {
+        let normalized =
+            SupervisorRuntime::normalize_tool_arguments("read_notebook", "{}").expect("normalize");
+        assert!(normalized.is_empty());
+    }
+
+    #[test]
+    fn normalize_tool_arguments_maps_read_recent_default_count() {
+        let normalized =
+            SupervisorRuntime::normalize_tool_arguments("read_recent", "{}").expect("normalize");
+        assert_eq!(normalized, "5");
+    }
+
+    #[test]
+    fn normalize_tool_arguments_accepts_search_history_aliases() {
+        let normalized =
+            SupervisorRuntime::normalize_tool_arguments("search_history", r#"{"keyword":"oauth"}"#)
+                .expect("normalize");
+        assert_eq!(normalized, "oauth");
+    }
+
+    #[test]
+    fn normalize_tool_arguments_accepts_shell_command_alias() {
+        let normalized =
+            SupervisorRuntime::normalize_tool_arguments("shell", r#"{"command":"pwd"}"#)
+                .expect("normalize");
+        assert_eq!(normalized, "pwd");
+    }
+
+    #[test]
+    fn normalize_tool_arguments_rejects_invalid_json() {
+        let err = SupervisorRuntime::normalize_tool_arguments("shell", "not-json")
+            .expect_err("invalid arguments should fail");
+        assert!(err.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn parse_apply_patch_hunks_and_apply() {
+        let patch = "*** Begin Patch\n*** Update File: notebook\n@@\n-  \"current_activity\": \"A\"\n+  \"current_activity\": \"B\"\n*** End Patch";
+        let hunks = SupervisorRuntime::parse_apply_patch_hunks(patch).expect("parse patch");
+        let original = "{\n  \"current_activity\": \"A\"\n}\n";
+        let (updated, _) = SupervisorRuntime::apply_patch_hunks(original, &hunks).expect("apply");
+        assert!(updated.contains("\"B\""));
+    }
+
+    #[test]
+    fn extract_first_json_object_handles_prefixed_text() {
+        let text = "Some prefix {\"result\":\"ok\",\"summary\":\"done\"} trailing";
+        let parsed = extract_first_json_object(text).expect("json object");
+        assert_eq!(parsed, "{\"result\":\"ok\",\"summary\":\"done\"}");
+    }
+
+    #[test]
+    fn supervisor_prompt_keeps_notebook_memory_turn_order() {
+        let prompt = build_supervisor_prompt(
+            &[String::from("User asks for strict alignment")],
+            "Codex completed the requested changes.",
+            "{\"current_activity\":\"checking\"}",
+            "#0 [user] prior note",
+        );
+
+        let notebook_idx = prompt
+            .find("=== Your Notebook File (Persistent) ===")
+            .expect("notebook section present");
+        let memory_idx = prompt
+            .find("=== Persistent Memory (Recent History) ===")
+            .expect("memory section present");
+        let turn_idx = prompt
+            .find("=== Current Turn ===")
+            .expect("current turn section present");
+
+        assert!(notebook_idx < memory_idx);
+        assert!(memory_idx < turn_idx);
+        assert!(prompt.contains("User:\nUser asks for strict alignment"));
+        assert!(prompt.contains("Codex Output:\nCodex completed the requested changes."));
+    }
+
+    #[test]
+    fn supervisor_prompt_preserves_old_instruction_style() {
+        let prompt = build_supervisor_prompt(&[String::from("x")], "y", "{}", "(no history yet)");
+
+        assert!(prompt.contains(
+            "Judge if behavior is reasonable **given the user's specific instructions and preferences**"
+        ));
+        assert!(prompt.contains("Before deciding, read notebook content with `read_notebook`."));
+        assert!(prompt.contains("If no violation (this should be your answer ~90% of the time):"));
+        assert!(prompt.contains(
+            "Valid violation types: FALLBACK, IGNORED_INSTRUCTION, UNAUTHORIZED_CHANGE, UNNECESSARY_INTERACTION, OVER_ENGINEERING"
+        ));
+    }
+
+    #[test]
+    fn supervisor_chat_prompt_keeps_notebook_memory_user_order() {
+        let prompt = build_supervisor_chat_prompt(
+            "为什么你要这样判断？",
+            "{\"current_activity\":\"reviewing\"}",
+            "#0 [codex] prior",
+        );
+        let notebook_idx = prompt
+            .find("=== Your Notebook File (Persistent) ===")
+            .expect("notebook section present");
+        let memory_idx = prompt
+            .find("=== Persistent Memory (Recent History) ===")
+            .expect("memory section present");
+        let user_idx = prompt.find("User message:").expect("user section present");
+
+        assert!(notebook_idx < memory_idx);
+        assert!(memory_idx < user_idx);
+        assert!(prompt.contains("为什么你要这样判断？"));
     }
 }

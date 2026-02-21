@@ -1399,7 +1399,11 @@ impl HistoryCell for McpToolCallCell {
                 .subsequent_indent("    ".into());
             let wrapped = word_wrap_line(&invocation_line, opts);
             let body_lines: Vec<Line<'static>> = wrapped.iter().map(line_to_static).collect();
-            lines.extend(prefix_lines(body_lines, "  └ ".dim(), "    ".into()));
+            lines.extend(prefix_lines(
+                body_lines,
+                "  └ ".magenta().dim(),
+                "  │ ".magenta().dim(),
+            ));
         }
 
         let mut detail_lines: Vec<Line<'static>> = Vec::new();
@@ -1445,11 +1449,15 @@ impl HistoryCell for McpToolCallCell {
 
         if !detail_lines.is_empty() {
             let initial_prefix: Span<'static> = if inline_invocation {
-                "  └ ".dim()
+                "  └ ".magenta().dim()
             } else {
-                "    ".into()
+                "  │ ".magenta().dim()
             };
-            lines.extend(prefix_lines(detail_lines, initial_prefix, "    ".into()));
+            lines.extend(prefix_lines(
+                detail_lines,
+                initial_prefix,
+                "  │ ".magenta().dim(),
+            ));
         }
 
         lines

@@ -3405,6 +3405,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::UserInput { .. } | Op::UserTurn { .. } => {
                 handlers::user_input_or_turn(&sess, sub.id.clone(), sub.op).await;
             }
+            Op::SupervisorChat { message } => {
+                handlers::supervisor_chat(&sess, sub.id.clone(), message).await;
+            }
             Op::ExecApproval {
                 id: approval_id,
                 turn_id,
@@ -3551,6 +3554,7 @@ mod handlers {
     use codex_protocol::config_types::Settings;
     use codex_protocol::dynamic_tools::DynamicToolResponse;
     use codex_protocol::mcp::RequestId as ProtocolRequestId;
+    use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::user_input::UserInput;
     use codex_rmcp_client::ElicitationAction;
     use codex_rmcp_client::ElicitationResponse;
@@ -3650,6 +3654,61 @@ mod handlers {
             let regular_task = sess.take_startup_regular_task().await.unwrap_or_default();
             sess.spawn_task(Arc::clone(&current_context), items, regular_task)
                 .await;
+        }
+    }
+
+    pub async fn supervisor_chat(sess: &Arc<Session>, sub_id: String, message: String) {
+        let message = message.trim();
+        if message.is_empty() {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Warning(WarningEvent {
+                    message: "Gugugaga chat message is empty.".to_string(),
+                }),
+            })
+            .await;
+            return;
+        }
+
+        if !sess.services.supervisor.enabled() {
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Warning(WarningEvent {
+                    message:
+                        "Gugugaga supervisor is disabled. Set GUGUGAGA_SUPERVISOR_ENABLED=1 to enable it."
+                            .to_string(),
+                }),
+            })
+            .await;
+            return;
+        }
+
+        let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+        match sess
+            .services
+            .supervisor
+            .chat_with_user(message, turn_context.as_ref(), &sess.services.model_client)
+            .await
+        {
+            Ok(reply) => {
+                sess.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::AgentMessage(AgentMessageEvent {
+                        message: format!("Gugugaga: {reply}"),
+                        phase: None,
+                    }),
+                )
+                .await;
+            }
+            Err(err) => {
+                sess.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::Warning(WarningEvent {
+                        message: format!("Gugugaga chat failed: {err}"),
+                    }),
+                )
+                .await;
+            }
         }
     }
 
@@ -4820,19 +4879,47 @@ pub(crate) async fn run_turn(
                         .await;
                         return None;
                     }
-                    if sess.services.supervisor.enabled()
-                        && let Some(message) = sess
+                    if sess.services.supervisor.enabled() {
+                        sess.notify_background_event(
+                            &turn_context,
+                            "Supervising: Analyzing completed turn...",
+                        )
+                        .await;
+
+                        match sess
                             .services
                             .supervisor
-                            .after_agent(
+                            .after_agent_with_turn(
                                 turn_context.sub_id.as_str(),
                                 &sampling_request_input_messages,
                                 last_agent_message.as_deref(),
+                                Some(turn_context.as_ref()),
+                                Some(&sess.services.model_client),
                             )
+                            .or_cancel(&cancellation_token)
                             .await
-                    {
-                        sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
-                            .await;
+                        {
+                            Ok(Some(outcome)) => {
+                                for event in outcome.events {
+                                    sess.send_event(&turn_context, event).await;
+                                }
+                                if let Some(message) = outcome.warning_message {
+                                    sess.send_event(
+                                        &turn_context,
+                                        EventMsg::Warning(WarningEvent { message }),
+                                    )
+                                    .await;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(codex_async_utils::CancelErr::Cancelled) => {
+                                sess.notify_background_event(
+                                    &turn_context,
+                                    "Supervising: Interrupted.",
+                                )
+                                .await;
+                            }
+                        }
                     }
                     break;
                 }

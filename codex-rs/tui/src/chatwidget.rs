@@ -727,6 +727,78 @@ impl From<&str> for UserMessage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GugugagaCommand {
+    Help,
+    Clear,
+    Stats,
+    Model,
+    Notebook,
+}
+
+impl GugugagaCommand {
+    fn all() -> &'static [GugugagaCommand] {
+        &[
+            GugugagaCommand::Help,
+            GugugagaCommand::Clear,
+            GugugagaCommand::Stats,
+            GugugagaCommand::Model,
+            GugugagaCommand::Notebook,
+        ]
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            GugugagaCommand::Help => "help",
+            GugugagaCommand::Clear => "clear",
+            GugugagaCommand::Stats => "stats",
+            GugugagaCommand::Model => "model",
+            GugugagaCommand::Notebook => "notebook",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            GugugagaCommand::Help => "Show Gugugaga help",
+            GugugagaCommand::Clear => "Start a fresh Gugugaga session",
+            GugugagaCommand::Stats => "Show supervision status",
+            GugugagaCommand::Model => "Open or set Gugugaga model",
+            GugugagaCommand::Notebook => "Show Gugugaga notebook",
+        }
+    }
+
+    fn parse(name: &str) -> Option<GugugagaCommand> {
+        let name = name.to_ascii_lowercase();
+        Self::all().iter().copied().find(|cmd| cmd.name() == name)
+    }
+}
+
+#[derive(Debug)]
+enum ParsedGugugagaInput {
+    Command(GugugagaCommand, String),
+    Chat(String),
+}
+
+fn parse_gugugaga_input(input: &str) -> Option<ParsedGugugagaInput> {
+    let trimmed = input.trim();
+    let rest = trimmed.strip_prefix("//")?;
+    if rest.trim().is_empty() {
+        return Some(ParsedGugugagaInput::Command(
+            GugugagaCommand::Help,
+            String::new(),
+        ));
+    }
+    let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+    let cmd_name = parts.first().copied().unwrap_or_default().trim();
+    let args = parts.get(1).copied().unwrap_or_default().to_string();
+
+    if let Some(cmd) = GugugagaCommand::parse(cmd_name) {
+        return Some(ParsedGugugagaInput::Command(cmd, args));
+    }
+
+    Some(ParsedGugugagaInput::Chat(rest.trim().to_string()))
+}
+
 pub(crate) fn create_initial_user_message(
     text: Option<String>,
     local_image_paths: Vec<PathBuf>,
@@ -3174,6 +3246,15 @@ impl ChatWidget {
                     text,
                     text_elements,
                 } => {
+                    if self.try_handle_gugugaga_submission(&text) {
+                        // Drain staged submission artifacts so they do not leak
+                        // into the next real user turn.
+                        self.bottom_pane
+                            .take_recent_submission_images_with_placeholders();
+                        self.take_remote_image_urls();
+                        self.bottom_pane.take_recent_submission_mention_bindings();
+                        return;
+                    }
                     let local_images = self
                         .bottom_pane
                         .take_recent_submission_images_with_placeholders();
@@ -3202,6 +3283,13 @@ impl ChatWidget {
                     text,
                     text_elements,
                 } => {
+                    if self.try_handle_gugugaga_submission(&text) {
+                        self.bottom_pane
+                            .take_recent_submission_images_with_placeholders();
+                        self.take_remote_image_urls();
+                        self.bottom_pane.take_recent_submission_mention_bindings();
+                        return;
+                    }
                     let local_images = self
                         .bottom_pane
                         .take_recent_submission_images_with_placeholders();
@@ -3273,6 +3361,199 @@ impl ChatWidget {
 
     pub(crate) fn can_launch_external_editor(&self) -> bool {
         self.bottom_pane.can_launch_external_editor()
+    }
+
+    fn try_handle_gugugaga_submission(&mut self, text: &str) -> bool {
+        let Some(parsed) = parse_gugugaga_input(text) else {
+            return false;
+        };
+
+        match parsed {
+            ParsedGugugagaInput::Command(cmd, args) => self.dispatch_gugugaga_command(cmd, args),
+            ParsedGugugagaInput::Chat(message) => self.submit_gugugaga_chat_message(message),
+        }
+        self.request_redraw();
+        true
+    }
+
+    fn submit_gugugaga_chat_message(&mut self, message: String) {
+        let message = message.trim();
+        if message.is_empty() {
+            self.add_error_message("Gugugaga chat message cannot be empty.".to_string());
+            return;
+        }
+        if !self.is_session_configured() {
+            self.add_error_message("Session is not ready yet; try again in a moment.".to_string());
+            return;
+        }
+
+        self.add_to_history(history_cell::new_user_prompt(
+            format!("// {message}"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        self.submit_op(Op::SupervisorChat {
+            message: message.to_string(),
+        });
+    }
+
+    fn dispatch_gugugaga_command(&mut self, cmd: GugugagaCommand, args: String) {
+        let trimmed_args = args.trim().to_string();
+        self.add_gugugaga_command_echo(cmd, &trimmed_args);
+        match cmd {
+            GugugagaCommand::Help => {
+                let mut lines = vec!["Gugugaga commands (//):".to_string(), "".to_string()];
+                for command in GugugagaCommand::all().iter().copied() {
+                    lines.push(format!(
+                        "  //{:<10} - {}",
+                        command.name(),
+                        command.description()
+                    ));
+                }
+                lines.push("".to_string());
+                lines.push("Codex commands (/): use the existing /... command set.".to_string());
+                self.add_info_message(lines.join("\n"), None);
+            }
+            GugugagaCommand::Clear => {
+                if self.bottom_pane.is_task_running() {
+                    self.add_error_message(
+                        "'//clear' is disabled while a task is in progress.".to_string(),
+                    );
+                } else {
+                    self.app_event_tx.send(AppEvent::NewSession);
+                }
+            }
+            GugugagaCommand::Stats => {
+                let thread_label = self
+                    .thread_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "(none)".to_string());
+                let notebook_path = self
+                    .thread_id
+                    .as_ref()
+                    .map(|thread_id| {
+                        self.config
+                            .codex_home
+                            .join("gugugaga")
+                            .join("notebooks")
+                            .join(format!("{thread_id}.json"))
+                    })
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "(thread id not available yet)".to_string());
+                let status = [
+                    "Gugugaga status".to_string(),
+                    format!("  thread: {thread_label}"),
+                    format!("  running: {}", self.bottom_pane.is_task_running()),
+                    format!("  queued messages: {}", self.queued_user_messages.len()),
+                    format!("  notebook: {notebook_path}"),
+                ]
+                .join("\n");
+                self.add_info_message(status, None);
+            }
+            GugugagaCommand::Model => {
+                if trimmed_args.is_empty() {
+                    self.open_model_popup();
+                    return;
+                }
+
+                let mut tokens = trimmed_args.split_whitespace();
+                let requested_model = tokens.next().unwrap_or_default();
+                if tokens.next().is_some() {
+                    self.add_error_message(
+                        "`//model` currently accepts one model slug, for example `//model gpt-5`."
+                            .to_string(),
+                    );
+                    return;
+                }
+
+                let presets = match self.models_manager.try_list_models() {
+                    Ok(models) => models,
+                    Err(_) => {
+                        self.add_info_message(
+                            "Models are being updated; please try //model again in a moment."
+                                .to_string(),
+                            None,
+                        );
+                        return;
+                    }
+                };
+
+                let requested_lower = requested_model.to_ascii_lowercase();
+                let selected = presets
+                    .iter()
+                    .find(|preset| preset.model.eq_ignore_ascii_case(requested_model))
+                    .or_else(|| {
+                        presets.iter().find(|preset| {
+                            preset
+                                .model
+                                .to_ascii_lowercase()
+                                .starts_with(&requested_lower)
+                        })
+                    });
+
+                if let Some(preset) = selected {
+                    let selected_model = preset.model.to_string();
+                    self.apply_model_and_effort(
+                        selected_model.clone(),
+                        Some(preset.default_reasoning_effort),
+                    );
+                    self.add_info_message(format!("Gugugaga model set to {selected_model}."), None);
+                    return;
+                }
+
+                let suggestions: Vec<String> = presets
+                    .iter()
+                    .filter(|preset| preset.model.to_ascii_lowercase().contains(&requested_lower))
+                    .map(|preset| preset.model.to_string())
+                    .take(5)
+                    .collect();
+
+                if suggestions.is_empty() {
+                    self.add_error_message(format!("Unknown Gugugaga model: {requested_model}."));
+                } else {
+                    self.add_error_message(format!(
+                        "Unknown Gugugaga model: {requested_model}. Candidates: {}",
+                        suggestions.join(", ")
+                    ));
+                }
+            }
+            GugugagaCommand::Notebook => {
+                let Some(thread_id) = self.thread_id else {
+                    self.add_info_message(
+                        "Notebook is unavailable until the session thread is ready.".to_string(),
+                        None,
+                    );
+                    return;
+                };
+                let notebook_path = self
+                    .config
+                    .codex_home
+                    .join("gugugaga")
+                    .join("notebooks")
+                    .join(format!("{thread_id}.json"));
+                match std::fs::read_to_string(&notebook_path) {
+                    Ok(raw) => self.add_info_message(
+                        raw,
+                        Some(format!("Notebook path: {}", notebook_path.display())),
+                    ),
+                    Err(err) => self.add_error_message(format!(
+                        "Failed to read notebook ({}): {err}",
+                        notebook_path.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    fn add_gugugaga_command_echo(&mut self, cmd: GugugagaCommand, args: &str) {
+        let line = if args.is_empty() {
+            format!("//{}", cmd.name())
+        } else {
+            format!("//{} {args}", cmd.name())
+        };
+        self.add_plain_history_lines(vec![line.magenta().into()]);
     }
 
     fn dispatch_command(&mut self, cmd: SlashCommand) {

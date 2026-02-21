@@ -18,6 +18,9 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
     if !config.check_for_update_on_startup {
         return None;
     }
+    if is_dev_placeholder_version(CODEX_CLI_VERSION) {
+        return None;
+    }
 
     let version_file = version_filepath(config);
     let info = read_version_info(&version_file).ok();
@@ -43,6 +46,10 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
             None
         }
     })
+}
+
+fn is_dev_placeholder_version(version: &str) -> bool {
+    matches!(parse_version(version), Some((0, 0, 0)))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -140,6 +147,9 @@ pub fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
     if !config.check_for_update_on_startup {
         return None;
     }
+    if is_dev_placeholder_version(CODEX_CLI_VERSION) {
+        return None;
+    }
 
     let version_file = version_filepath(config);
     let latest = get_upgrade_version(config)?;
@@ -227,5 +237,12 @@ mod tests {
     fn whitespace_is_ignored() {
         assert_eq!(parse_version(" 1.2.3 \n"), Some((1, 2, 3)));
         assert_eq!(is_newer(" 1.2.3 ", "1.2.2"), Some(true));
+    }
+
+    #[test]
+    fn placeholder_dev_version_disables_upgrade_prompt() {
+        assert!(is_dev_placeholder_version("0.0.0"));
+        assert!(!is_dev_placeholder_version("0.0.1"));
+        assert!(!is_dev_placeholder_version("0.104.0"));
     }
 }
