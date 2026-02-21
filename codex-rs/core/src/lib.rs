@@ -61,6 +61,7 @@ pub mod sandboxing;
 mod session_prefix;
 mod shell_detect;
 mod stream_events_utils;
+mod supervisor;
 mod tagged_block_parser;
 pub mod test_support;
 mod text_encoding;

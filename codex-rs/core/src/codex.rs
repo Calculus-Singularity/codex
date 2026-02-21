@@ -227,6 +227,7 @@ use crate::state::ActiveTurn;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
+use crate::supervisor::SupervisorRuntime;
 use crate::tasks::GhostSnapshotTask;
 use crate::tasks::RegularTask;
 use crate::tasks::ReviewTask;
@@ -1290,6 +1291,9 @@ impl Session {
         zsh_exec_bridge
             .initialize_for_session(&conversation_id.to_string())
             .await;
+        let supervisor = Arc::new(
+            SupervisorRuntime::from_env(config.codex_home.as_path(), conversation_id).await,
+        );
 
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized
@@ -1328,6 +1332,7 @@ impl Session {
             agent_control,
             network_proxy,
             network_approval: Arc::clone(&network_approval),
+            supervisor,
             state_db: state_db_ctx.clone(),
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
@@ -3768,7 +3773,21 @@ mod handlers {
         id: String,
         response: RequestUserInputResponse,
     ) {
+        let supervisor_response = response.clone();
         sess.notify_user_input_response(&id, response).await;
+        if sess.services.supervisor.enabled()
+            && let Some(message) = sess
+                .services
+                .supervisor
+                .request_user_input_response(id.as_str(), &supervisor_response)
+                .await
+        {
+            sess.send_event_raw(Event {
+                id,
+                msg: EventMsg::Warning(WarningEvent { message }),
+            })
+            .await;
+        }
     }
 
     pub async fn dynamic_tool_response(
@@ -4754,7 +4773,7 @@ pub(crate) async fn run_turn(
                                 event: HookEventAfterAgent {
                                     thread_id: sess.conversation_id,
                                     turn_id: turn_context.sub_id.clone(),
-                                    input_messages: sampling_request_input_messages,
+                                    input_messages: sampling_request_input_messages.clone(),
                                     last_assistant_message: last_agent_message.clone(),
                                 },
                             },
@@ -4800,6 +4819,20 @@ pub(crate) async fn run_turn(
                         )
                         .await;
                         return None;
+                    }
+                    if sess.services.supervisor.enabled()
+                        && let Some(message) = sess
+                            .services
+                            .supervisor
+                            .after_agent(
+                                turn_context.sub_id.as_str(),
+                                &sampling_request_input_messages,
+                                last_agent_message.as_deref(),
+                            )
+                            .await
+                    {
+                        sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
+                            .await;
                     }
                     break;
                 }
@@ -7803,6 +7836,9 @@ mod tests {
         let state = SessionState::new(session_configuration.clone());
         let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone()));
         let network_approval = Arc::new(NetworkApprovalService::default());
+        let supervisor = Arc::new(
+            SupervisorRuntime::from_env(config.codex_home.as_path(), conversation_id).await,
+        );
 
         let file_watcher = Arc::new(FileWatcher::noop());
         let services = SessionServices {
@@ -7837,6 +7873,7 @@ mod tests {
             agent_control,
             network_proxy: None,
             network_approval: Arc::clone(&network_approval),
+            supervisor,
             state_db: None,
             model_client: ModelClient::new(
                 Some(auth_manager.clone()),
@@ -7959,6 +7996,9 @@ mod tests {
         let state = SessionState::new(session_configuration.clone());
         let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone()));
         let network_approval = Arc::new(NetworkApprovalService::default());
+        let supervisor = Arc::new(
+            SupervisorRuntime::from_env(config.codex_home.as_path(), conversation_id).await,
+        );
 
         let file_watcher = Arc::new(FileWatcher::noop());
         let services = SessionServices {
@@ -7993,6 +8033,7 @@ mod tests {
             agent_control,
             network_proxy: None,
             network_approval: Arc::clone(&network_approval),
+            supervisor,
             state_db: None,
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),

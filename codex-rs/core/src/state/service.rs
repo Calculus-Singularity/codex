@@ -12,6 +12,7 @@ use crate::mcp_connection_manager::McpConnectionManager;
 use crate::models_manager::manager::ModelsManager;
 use crate::skills::SkillsManager;
 use crate::state_db::StateDbHandle;
+use crate::supervisor::SupervisorRuntime;
 use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -44,6 +45,7 @@ pub(crate) struct SessionServices {
     pub(crate) agent_control: AgentControl,
     pub(crate) network_proxy: Option<StartedNetworkProxy>,
     pub(crate) network_approval: Arc<NetworkApprovalService>,
+    pub(crate) supervisor: Arc<SupervisorRuntime>,
     pub(crate) state_db: Option<StateDbHandle>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
