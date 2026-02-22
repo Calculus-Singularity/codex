@@ -267,6 +267,80 @@ async fn resumed_initial_messages_render_history() {
 }
 
 #[tokio::test]
+async fn resumed_gugugaga_agent_message_keeps_magenta_prefix() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    let conversation_id = ThreadId::new();
+    let rollout_file = NamedTempFile::new().unwrap();
+    let configured = codex_protocol::protocol::SessionConfiguredEvent {
+        session_id: conversation_id,
+        forked_from_id: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        approval_policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        cwd: PathBuf::from("/home/user/project"),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        history_log_id: 0,
+        history_entry_count: 0,
+        initial_messages: Some(vec![EventMsg::AgentMessage(AgentMessageEvent {
+            message: "supervisor replay reply".to_string(),
+            phase: Some(MessagePhase::Commentary),
+        })]),
+        network_proxy: None,
+        rollout_path: Some(rollout_file.path().to_path_buf()),
+    };
+
+    chat.handle_codex_event(Event {
+        id: "initial".into(),
+        msg: EventMsg::SessionConfigured(configured),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let text_blob = cells
+        .iter()
+        .flat_map(|lines| lines.iter())
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.clone())
+        .collect::<String>();
+
+    assert!(
+        text_blob.contains("▎ supervisor replay reply"),
+        "expected resumed Gugugaga message to keep magenta prefixed style; got: {text_blob:?}",
+    );
+}
+
+#[tokio::test]
+async fn live_gugugaga_commentary_renders_magenta_while_turn_running() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+    chat.pending_gugugaga_chat_replies = 1;
+    chat.on_task_started();
+
+    chat.handle_codex_event(Event {
+        id: "supervisor-chat".into(),
+        msg: EventMsg::AgentMessage(AgentMessageEvent {
+            message: "live supervisor reply".to_string(),
+            phase: Some(MessagePhase::Commentary),
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let text_blob = cells
+        .iter()
+        .flat_map(|lines| lines.iter())
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.clone())
+        .collect::<String>();
+
+    assert!(
+        text_blob.contains("▎ live supervisor reply"),
+        "expected live Gugugaga commentary to keep magenta style while running; got: {text_blob:?}",
+    );
+    assert_eq!(chat.pending_gugugaga_chat_replies, 0);
+}
+
+#[tokio::test]
 async fn replayed_user_message_preserves_text_elements_and_local_images() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
 
@@ -1687,6 +1761,8 @@ async fn make_chatwidget_manual(
         task_complete_pending: false,
         unified_exec_processes: Vec::new(),
         agent_turn_running: false,
+        pending_gugugaga_chat_replies: 0,
+        pending_supervisor_turn_ack: false,
         mcp_startup_status: None,
         connectors_cache: ConnectorsCacheState::default(),
         connectors_prefetch_in_flight: false,

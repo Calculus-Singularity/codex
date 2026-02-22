@@ -596,6 +596,10 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
+    // Number of outstanding `// chat` requests waiting for a Gugugaga reply.
+    pending_gugugaga_chat_replies: usize,
+    // Set when supervisor starts post-turn review; consumed by the next ack message.
+    pending_supervisor_turn_ack: bool,
     /// Terminal-appropriate keybinding for popping the most-recently queued
     /// message back into the composer.  Determined once at construction time via
     /// [`queued_message_edit_binding_for_terminal`] and propagated to
@@ -1282,7 +1286,10 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn on_agent_message(&mut self, message: String) {
+    fn on_agent_message(&mut self, message: String, phase: Option<MessagePhase>) {
+        if self.try_render_gugugaga_agent_message(message.as_str(), phase.as_ref()) {
+            return;
+        }
         // If we have a stream_controller, then the final agent message is redundant and will be a
         // duplicate of what has already been streamed.
         if self.stream_controller.is_none() && !message.is_empty() {
@@ -1402,6 +1409,7 @@ impl ChatWidget {
     fn on_task_started(&mut self) {
         self.agent_turn_running = true;
         self.turn_sleep_inhibitor.set_turn_running(true);
+        self.pending_supervisor_turn_ack = false;
         self.saw_plan_update_this_turn = false;
         self.saw_plan_item_this_turn = false;
         self.plan_delta_buffer.clear();
@@ -1458,6 +1466,7 @@ impl ChatWidget {
         }
         // Mark task stopped and request redraw now that all content is in history.
         self.pending_status_indicator_restore = false;
+        self.pending_supervisor_turn_ack = false;
         self.agent_turn_running = false;
         self.turn_sleep_inhibitor.set_turn_running(false);
         self.update_task_running_state();
@@ -1733,7 +1742,12 @@ impl ChatWidget {
     }
 
     fn on_warning(&mut self, message: impl Into<String>) {
-        self.add_to_history(history_cell::new_warning_event(message.into()));
+        let message = message.into();
+        if self.pending_gugugaga_chat_replies > 0 && message.starts_with("Gugugaga chat failed:") {
+            self.pending_gugugaga_chat_replies =
+                self.pending_gugugaga_chat_replies.saturating_sub(1);
+        }
+        self.add_to_history(history_cell::new_warning_event(message));
         self.request_redraw();
     }
 
@@ -2244,9 +2258,49 @@ impl ChatWidget {
 
     fn on_background_event(&mut self, message: String) {
         debug!("BackgroundEvent: {message}");
+        if message.starts_with("Supervising: Analyzing completed turn") {
+            self.pending_supervisor_turn_ack = true;
+        }
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.set_interrupt_hint_visible(true);
         self.set_status_header(message);
+    }
+
+    fn try_render_gugugaga_agent_message(
+        &mut self,
+        message: &str,
+        phase: Option<&MessagePhase>,
+    ) -> bool {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let from_phase = matches!(phase, Some(MessagePhase::Commentary))
+            && (!self.agent_turn_running
+                || self.pending_gugugaga_chat_replies > 0
+                || self.pending_supervisor_turn_ack);
+        let from_chat = self.pending_gugugaga_chat_replies > 0 && !self.agent_turn_running;
+        let from_turn_ack = self.pending_supervisor_turn_ack;
+        if !from_phase && !from_chat && !from_turn_ack {
+            return false;
+        }
+
+        let consume_chat_pending =
+            from_chat || (from_phase && self.pending_gugugaga_chat_replies > 0);
+        if consume_chat_pending {
+            self.pending_gugugaga_chat_replies =
+                self.pending_gugugaga_chat_replies.saturating_sub(1);
+        }
+        if from_turn_ack {
+            self.pending_supervisor_turn_ack = false;
+        }
+
+        self.flush_answer_stream_with_separator();
+        self.handle_stream_finished();
+        self.add_to_history(history_cell::new_gugugaga_message(trimmed.to_string()));
+        self.request_redraw();
+        true
     }
 
     fn on_undo_started(&mut self, event: UndoStartedEvent) {
@@ -2773,6 +2827,8 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            pending_gugugaga_chat_replies: 0,
+            pending_supervisor_turn_ack: false,
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
@@ -2947,6 +3003,8 @@ impl ChatWidget {
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
+            pending_gugugaga_chat_replies: 0,
+            pending_supervisor_turn_ack: false,
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
             suppress_session_configured_redraw: false,
@@ -3102,6 +3160,8 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
+            pending_gugugaga_chat_replies: 0,
+            pending_supervisor_turn_ack: false,
             queued_message_edit_binding,
             show_welcome_banner: false,
             suppress_session_configured_redraw: true,
@@ -3387,12 +3447,10 @@ impl ChatWidget {
             return;
         }
 
-        self.add_to_history(history_cell::new_user_prompt(
-            format!("// {message}"),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+        self.add_to_history(history_cell::new_user_to_gugugaga_prompt(
+            message.to_string(),
         ));
+        self.pending_gugugaga_chat_replies = self.pending_gugugaga_chat_replies.saturating_add(1);
         self.submit_op(Op::SupervisorChat {
             message: message.to_string(),
         });
@@ -4325,8 +4383,8 @@ impl ChatWidget {
         match msg {
             EventMsg::SessionConfigured(e) => self.on_session_configured(e),
             EventMsg::ThreadNameUpdated(e) => self.on_thread_name_updated(e),
-            EventMsg::AgentMessage(AgentMessageEvent { message, .. }) => {
-                self.on_agent_message(message)
+            EventMsg::AgentMessage(AgentMessageEvent { message, phase }) => {
+                self.on_agent_message(message, phase)
             }
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                 self.on_agent_message_delta(delta)
@@ -4442,7 +4500,9 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request, from_replay)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
-            EventMsg::ContextCompacted(_) => self.on_agent_message("Context compacted".to_owned()),
+            EventMsg::ContextCompacted(_) => {
+                self.on_agent_message("Context compacted".to_owned(), None)
+            }
             EventMsg::CollabAgentSpawnBegin(_) => {}
             EventMsg::CollabAgentSpawnEnd(ev) => self.on_collab_event(multi_agents::spawn_end(ev)),
             EventMsg::CollabAgentInteractionBegin(_) => {}

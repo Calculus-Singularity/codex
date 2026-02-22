@@ -1109,6 +1109,22 @@ pub(crate) fn new_user_prompt(
     }
 }
 
+pub(crate) fn new_user_to_gugugaga_prompt(message: String) -> PrefixedWrappedHistoryCell {
+    PrefixedWrappedHistoryCell::new(
+        Text::from(message),
+        Line::from(vec!["▎".magenta(), "› ".magenta().bold()]),
+        Line::from(vec!["▎".magenta(), "  ".into()]),
+    )
+}
+
+pub(crate) fn new_gugugaga_message(message: String) -> PrefixedWrappedHistoryCell {
+    PrefixedWrappedHistoryCell::new(
+        Text::from(message),
+        Line::from(vec!["▎".magenta(), " ".into()]),
+        Line::from(vec!["▎".magenta(), " ".into()]),
+    )
+}
+
 #[derive(Debug)]
 pub(crate) struct SessionHeaderHistoryCell {
     version: &'static str,

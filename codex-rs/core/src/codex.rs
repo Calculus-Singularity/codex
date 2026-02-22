@@ -169,6 +169,7 @@ use crate::proposed_plan_parser::ProposedPlanParser;
 use crate::proposed_plan_parser::ProposedPlanSegment;
 use crate::proposed_plan_parser::extract_proposed_plan_text;
 use crate::protocol::AgentMessageContentDeltaEvent;
+use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentReasoningSectionBreakEvent;
 use crate::protocol::ApplyPatchApprovalRequestEvent;
 use crate::protocol::AskForApproval;
@@ -258,6 +259,7 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DeveloperInstructions;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -3545,6 +3547,8 @@ mod handlers {
     use codex_protocol::protocol::ThreadNameUpdatedEvent;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TurnAbortReason;
+    use codex_protocol::protocol::TurnCompleteEvent;
+    use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::WarningEvent;
     use codex_protocol::request_user_input::RequestUserInputResponse;
 
@@ -3554,6 +3558,7 @@ mod handlers {
     use codex_protocol::config_types::Settings;
     use codex_protocol::dynamic_tools::DynamicToolResponse;
     use codex_protocol::mcp::RequestId as ProtocolRequestId;
+    use codex_protocol::models::MessagePhase;
     use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::user_input::UserInput;
     use codex_rmcp_client::ElicitationAction;
@@ -3684,18 +3689,41 @@ mod handlers {
         }
 
         let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+        sess.send_event(
+            turn_context.as_ref(),
+            EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_context.sub_id.clone(),
+                model_context_window: turn_context.model_context_window(),
+                collaboration_mode_kind: turn_context.collaboration_mode.mode,
+            }),
+        )
+        .await;
+
         match sess
             .services
             .supervisor
             .chat_with_user(message, turn_context.as_ref(), &sess.services.model_client)
             .await
         {
-            Ok(reply) => {
+            Ok(outcome) => {
+                let _notebook_changed = outcome.notebook_changed;
+                let last_agent_message = outcome.reply.clone();
+                for event in outcome.events {
+                    sess.send_event(turn_context.as_ref(), event).await;
+                }
                 sess.send_event(
                     turn_context.as_ref(),
                     EventMsg::AgentMessage(AgentMessageEvent {
-                        message: format!("Gugugaga: {reply}"),
-                        phase: None,
+                        message: outcome.reply,
+                        phase: Some(MessagePhase::Commentary),
+                    }),
+                )
+                .await;
+                sess.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::TurnComplete(TurnCompleteEvent {
+                        turn_id: turn_context.sub_id.clone(),
+                        last_agent_message: Some(last_agent_message),
                     }),
                 )
                 .await;
@@ -3705,6 +3733,14 @@ mod handlers {
                     turn_context.as_ref(),
                     EventMsg::Warning(WarningEvent {
                         message: format!("Gugugaga chat failed: {err}"),
+                    }),
+                )
+                .await;
+                sess.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::TurnComplete(TurnCompleteEvent {
+                        turn_id: turn_context.sub_id.clone(),
+                        last_agent_message: None,
                     }),
                 )
                 .await;
@@ -4902,6 +4938,16 @@ pub(crate) async fn run_turn(
                             Ok(Some(outcome)) => {
                                 for event in outcome.events {
                                     sess.send_event(&turn_context, event).await;
+                                }
+                                if let Some(message) = outcome.user_ack_message {
+                                    sess.send_event(
+                                        &turn_context,
+                                        EventMsg::AgentMessage(AgentMessageEvent {
+                                            message,
+                                            phase: Some(MessagePhase::Commentary),
+                                        }),
+                                    )
+                                    .await;
                                 }
                                 if let Some(message) = outcome.warning_message {
                                     sess.send_event(
