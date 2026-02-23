@@ -4915,6 +4915,7 @@ pub(crate) async fn run_turn(
                         .await;
                         return None;
                     }
+                    let mut queued_supervisor_follow_up = false;
                     if sess.services.supervisor.enabled() {
                         sess.notify_background_event(
                             &turn_context,
@@ -4949,6 +4950,41 @@ pub(crate) async fn run_turn(
                                     )
                                     .await;
                                 }
+                                if let Some(message) = outcome.correction_user_message {
+                                    sess.send_event(
+                                        &turn_context,
+                                        EventMsg::AgentMessage(AgentMessageEvent {
+                                            message,
+                                            phase: Some(MessagePhase::Commentary),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                                if let Some(correction) = outcome.correction_to_codex {
+                                    let injected = sess
+                                        .steer_input(
+                                            vec![UserInput::Text {
+                                                text: correction,
+                                                text_elements: Vec::new(),
+                                            }],
+                                            Some(turn_context.sub_id.as_str()),
+                                        )
+                                        .await;
+                                    match injected {
+                                        Ok(_) => {
+                                            queued_supervisor_follow_up = true;
+                                        }
+                                        Err(_) => {
+                                            sess.send_event(
+                                                &turn_context,
+                                                EventMsg::Warning(WarningEvent {
+                                                    message: "gugugaga supervisor correction was generated but could not be queued".to_string(),
+                                                }),
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
                                 if let Some(message) = outcome.warning_message {
                                     sess.send_event(
                                         &turn_context,
@@ -4966,6 +5002,9 @@ pub(crate) async fn run_turn(
                                 .await;
                             }
                         }
+                    }
+                    if queued_supervisor_follow_up {
+                        continue;
                     }
                     break;
                 }
