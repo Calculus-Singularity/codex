@@ -102,6 +102,7 @@ use pretty_assertions::assert_eq;
 use serial_test::serial;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
 use tempfile::tempdir;
@@ -6958,6 +6959,124 @@ async fn apply_patch_events_emit_history_cells() {
     assert!(
         cells.is_empty(),
         "no success cell should be emitted anymore"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_begin_uses_notebook_semantic_cell_when_possible() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let temp = tempdir().expect("tempdir");
+    let notebook_dir = temp.path().join("gugugaga/notebooks");
+    fs::create_dir_all(&notebook_dir).expect("create notebook dir");
+    let notebook_path = notebook_dir.join("thread-1.json");
+
+    let after = "{\n  \"current_activity\": \"After activity\",\n  \"completed\": [],\n  \"attention\": [],\n  \"mistakes\": []\n}\n";
+    fs::write(&notebook_path, after).expect("write notebook");
+
+    let mut changes = HashMap::new();
+    changes.insert(
+        notebook_path,
+        FileChange::Update {
+            unified_diff: "@@ -2,1 +2,1 @@\n-  \"current_activity\": \"Before activity\",\n+  \"current_activity\": \"After activity\",".to_string(),
+            move_path: None,
+        },
+    );
+
+    chat.handle_codex_event(Event {
+        id: "notebook-begin".into(),
+        msg: EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
+            call_id: "call-notebook".into(),
+            turn_id: "turn-notebook".into(),
+            auto_approved: true,
+            changes,
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    assert!(!cells.is_empty(), "expected a notebook history cell");
+    let blob = lines_to_single_string(cells.last().expect("last cell"));
+    assert!(
+        blob.contains("Updated notebook"),
+        "expected notebook semantic title: {blob:?}"
+    );
+    assert!(
+        blob.contains("current_activity"),
+        "expected current_activity semantic section: {blob:?}"
+    );
+    assert!(
+        blob.contains("Before activity") && blob.contains("After activity"),
+        "expected before/after values in semantic diff: {blob:?}"
+    );
+    assert!(
+        !blob.contains("Edited thread-1.json"),
+        "should not fall back to generic file diff for valid notebook patch: {blob:?}"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_notebook_no_changes_renders_compact_status_card() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.handle_codex_event(Event {
+        id: "notebook-noop".into(),
+        msg: EventMsg::PatchApplyEnd(PatchApplyEndEvent {
+            call_id: "call-notebook-noop".into(),
+            turn_id: "turn-notebook-noop".into(),
+            stdout: "apply_patch_notebook: No changes applied".into(),
+            stderr: String::new(),
+            success: true,
+            changes: HashMap::new(),
+            status: CorePatchApplyStatus::Completed,
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one compact status card");
+    let blob = lines_to_single_string(&cells[0]);
+    assert!(
+        blob.contains("Updated notebook"),
+        "missing compact title: {blob:?}"
+    );
+    assert!(
+        blob.contains("No notebook changes were needed."),
+        "missing compact no-op text: {blob:?}"
+    );
+    assert!(
+        !blob.contains("Failed to apply patch"),
+        "should not render generic patch failure block: {blob:?}"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_notebook_validation_failure_renders_compact_status_card() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    chat.handle_codex_event(Event {
+        id: "notebook-fail".into(),
+        msg: EventMsg::PatchApplyEnd(PatchApplyEndEvent {
+            call_id: "call-notebook-fail".into(),
+            turn_id: "turn-notebook-fail".into(),
+            stdout: "apply_patch_notebook: Validation failed".into(),
+            stderr: "apply_patch_notebook: Validation failed\n- $.completed[0]: invalid item type"
+                .into(),
+            success: false,
+            changes: HashMap::new(),
+            status: CorePatchApplyStatus::Failed,
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one compact status card");
+    let blob = lines_to_single_string(&cells[0]);
+    assert!(
+        blob.contains("Failed to update notebook"),
+        "missing compact failure title: {blob:?}"
+    );
+    assert!(
+        blob.contains("Notebook patch validation failed."),
+        "missing compact failure message: {blob:?}"
+    );
+    assert!(
+        !blob.contains("Failed to apply patch"),
+        "should not render generic failure output: {blob:?}"
     );
 }
 

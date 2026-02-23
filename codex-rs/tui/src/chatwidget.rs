@@ -2053,10 +2053,15 @@ impl ChatWidget {
     }
 
     fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
-        self.add_to_history(history_cell::new_patch_event(
-            event.changes,
-            &self.config.cwd,
-        ));
+        if let Some(cell) = history_cell::new_notebook_patch_event(&event.changes, &self.config.cwd)
+        {
+            self.add_to_history(cell);
+        } else {
+            self.add_to_history(history_cell::new_patch_event(
+                event.changes,
+                &self.config.cwd,
+            ));
+        }
     }
 
     fn on_view_image_tool_call(&mut self, event: ViewImageToolCallEvent) {
@@ -2540,6 +2545,11 @@ impl ChatWidget {
         &mut self,
         event: codex_protocol::protocol::PatchApplyEndEvent,
     ) {
+        if let Some((success, message)) = notebook_patch_status_message(&event) {
+            self.add_to_history(history_cell::new_notebook_patch_status(success, message));
+            self.had_work_activity = true;
+            return;
+        }
         // If the patch was successful, just let the "Edited" block stand.
         // Otherwise, add a failure block.
         if !event.success {
@@ -7863,6 +7873,39 @@ fn extract_first_bold(s: &str) -> Option<String> {
         i += 1;
     }
     None
+}
+
+fn notebook_patch_status_message(
+    event: &codex_protocol::protocol::PatchApplyEndEvent,
+) -> Option<(bool, String)> {
+    if !event.changes.is_empty() {
+        return None;
+    }
+
+    let summary_line = [event.stdout.as_str(), event.stderr.as_str()]
+        .into_iter()
+        .map(str::trim)
+        .find(|text| text.starts_with("apply_patch_notebook:"))
+        .and_then(|text| text.lines().next())?
+        .trim();
+    let detail = summary_line
+        .strip_prefix("apply_patch_notebook:")
+        .map(str::trim)?;
+
+    if detail == "No changes applied" {
+        return Some((true, "No notebook changes were needed.".to_string()));
+    }
+    if detail.starts_with("Applied") {
+        return Some((true, "Notebook updated.".to_string()));
+    }
+    if detail.starts_with("Validation failed") {
+        return Some((false, "Notebook patch validation failed.".to_string()));
+    }
+    if detail.is_empty() {
+        return Some((event.success, "Notebook update failed.".to_string()));
+    }
+
+    Some((event.success, detail.to_string()))
 }
 
 async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Vec<RateLimitSnapshot> {

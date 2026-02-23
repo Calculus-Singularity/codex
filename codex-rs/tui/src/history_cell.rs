@@ -888,6 +888,408 @@ impl HistoryCell for PatchHistoryCell {
     }
 }
 
+#[derive(Debug, Default)]
+struct NotebookListDiff {
+    added: Vec<String>,
+    removed: Vec<String>,
+    changed: Vec<(String, String)>,
+}
+
+impl NotebookListDiff {
+    fn has_changes(&self) -> bool {
+        !self.added.is_empty() || !self.removed.is_empty() || !self.changed.is_empty()
+    }
+}
+
+#[derive(Debug, Default)]
+struct NotebookSemanticDiff {
+    display_path: String,
+    activity_change: Option<(Option<String>, Option<String>)>,
+    completed: NotebookListDiff,
+    attention: NotebookListDiff,
+    mistakes: NotebookListDiff,
+}
+
+impl NotebookSemanticDiff {
+    fn has_changes(&self) -> bool {
+        self.activity_change.is_some()
+            || self.completed.has_changes()
+            || self.attention.has_changes()
+            || self.mistakes.has_changes()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct NotebookPatchHistoryCell {
+    diff: NotebookSemanticDiff,
+}
+
+impl HistoryCell for NotebookPatchHistoryCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        render_notebook_diff_lines(&self.diff)
+    }
+}
+
+#[derive(Debug)]
+struct NotebookUnifiedDiff {
+    old_len: usize,
+    new_start: usize,
+    new_len: usize,
+    removed_lines: Vec<String>,
+}
+
+pub(crate) fn new_notebook_patch_event(
+    changes: &HashMap<PathBuf, FileChange>,
+    cwd: &Path,
+) -> Option<NotebookPatchHistoryCell> {
+    let (path, unified_diff) = single_notebook_update(changes)?;
+    let parsed = parse_notebook_unified_diff(unified_diff.as_str())?;
+    let after_text = std::fs::read_to_string(path).ok()?;
+    let before_text = reconstruct_before_notebook_json(after_text.as_str(), &parsed)?;
+
+    let before_value = serde_json::from_str::<serde_json::Value>(before_text.as_str()).ok()?;
+    let after_value = serde_json::from_str::<serde_json::Value>(after_text.as_str()).ok()?;
+    let mut semantic = build_notebook_semantic_diff(&before_value, &after_value);
+    if !semantic.has_changes() {
+        return None;
+    }
+
+    semantic.display_path = display_path_for(path, cwd);
+    Some(NotebookPatchHistoryCell { diff: semantic })
+}
+
+fn render_notebook_diff_lines(diff: &NotebookSemanticDiff) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        "• ".dim(),
+        "Updated notebook".bold(),
+        " ".into(),
+        diff.display_path.clone().dim(),
+    ]));
+
+    if let Some((before, after)) = &diff.activity_change {
+        lines.push(Line::from(vec!["  └ ".dim(), "current_activity".bold()]));
+        let before = before
+            .as_deref()
+            .map(|s| truncate_or_empty(s, 80))
+            .unwrap_or_else(|| "(empty)".to_string());
+        let after = after
+            .as_deref()
+            .map(|s| truncate_or_empty(s, 80))
+            .unwrap_or_else(|| "(empty)".to_string());
+        lines.push(Line::from(vec![
+            "    ~ ".yellow(),
+            before.yellow(),
+            " → ".yellow(),
+            after.yellow(),
+        ]));
+    }
+
+    append_notebook_list_section(&mut lines, "completed", &diff.completed);
+    append_notebook_list_section(&mut lines, "attention", &diff.attention);
+    append_notebook_list_section(&mut lines, "mistakes", &diff.mistakes);
+    lines
+}
+
+fn truncate_or_empty(text: &str, max_graphemes: usize) -> String {
+    if text.trim().is_empty() {
+        "(empty)".to_string()
+    } else {
+        truncate_text(text, max_graphemes)
+    }
+}
+
+fn append_notebook_list_section(
+    lines: &mut Vec<Line<'static>>,
+    name: &str,
+    diff: &NotebookListDiff,
+) {
+    if !diff.has_changes() {
+        return;
+    }
+    lines.push(Line::from(vec!["  └ ".dim(), name.to_string().bold()]));
+    for removed in &diff.removed {
+        lines.push(Line::from(vec![
+            "    - ".red(),
+            truncate_or_empty(removed, 140).red(),
+        ]));
+    }
+    for added in &diff.added {
+        lines.push(Line::from(vec![
+            "    + ".green(),
+            truncate_or_empty(added, 140).green(),
+        ]));
+    }
+    for (before, after) in &diff.changed {
+        lines.push(Line::from(vec![
+            "    ~ ".yellow(),
+            truncate_or_empty(before, 64).yellow(),
+            " → ".yellow(),
+            truncate_or_empty(after, 64).yellow(),
+        ]));
+    }
+}
+
+fn single_notebook_update(changes: &HashMap<PathBuf, FileChange>) -> Option<(&PathBuf, &String)> {
+    if changes.len() != 1 {
+        return None;
+    }
+    let (path, change) = changes.iter().next()?;
+    if !is_notebook_path(path.as_path()) {
+        return None;
+    }
+    match change {
+        FileChange::Update { unified_diff, .. } => Some((path, unified_diff)),
+        _ => None,
+    }
+}
+
+fn is_notebook_path(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    normalized.ends_with(".json")
+        && (normalized.contains("/gugugaga/notebooks/")
+            || normalized.starts_with("gugugaga/notebooks/")
+            || normalized.ends_with("/gugugaga/notebook.json")
+            || normalized == "gugugaga/notebook.json")
+}
+
+fn parse_notebook_unified_diff(diff: &str) -> Option<NotebookUnifiedDiff> {
+    let mut lines = diff.lines();
+    let header = lines.next()?.trim();
+    let range = header.strip_prefix("@@ -")?;
+    let (left, right_and_suffix) = range.split_once(" +")?;
+    let (right, _suffix) = right_and_suffix.split_once(" @@")?;
+    let (_old_start, old_len) = parse_unified_range(left)?;
+    let (new_start, new_len) = parse_unified_range(right)?;
+
+    let mut removed_lines = Vec::new();
+    let mut added_lines = Vec::new();
+    for line in lines {
+        if line.starts_with(r"\ No newline at end of file") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('-') {
+            removed_lines.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix('+') {
+            added_lines.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix(' ') {
+            removed_lines.push(rest.to_string());
+            added_lines.push(rest.to_string());
+        } else {
+            return None;
+        }
+    }
+
+    if removed_lines.len() != old_len || added_lines.len() != new_len {
+        return None;
+    }
+
+    Some(NotebookUnifiedDiff {
+        old_len,
+        new_start,
+        new_len,
+        removed_lines,
+    })
+}
+
+fn parse_unified_range(range: &str) -> Option<(usize, usize)> {
+    let (start, len) = range.split_once(',')?;
+    let start = start.parse::<usize>().ok()?;
+    let len = len.parse::<usize>().ok()?;
+    Some((start, len))
+}
+
+fn reconstruct_before_notebook_json(
+    after_text: &str,
+    diff: &NotebookUnifiedDiff,
+) -> Option<String> {
+    let after_lines: Vec<&str> = after_text.lines().collect();
+    let prefix_len = diff.new_start.checked_sub(1)?;
+    let replaced_end = prefix_len.checked_add(diff.new_len)?;
+    if replaced_end > after_lines.len() || diff.old_len != diff.removed_lines.len() {
+        return None;
+    }
+
+    let mut before_lines = Vec::new();
+    before_lines.extend(
+        after_lines[..prefix_len]
+            .iter()
+            .map(|line| (*line).to_string()),
+    );
+    before_lines.extend(diff.removed_lines.clone());
+    before_lines.extend(
+        after_lines[replaced_end..]
+            .iter()
+            .map(|line| (*line).to_string()),
+    );
+
+    let mut before = before_lines.join("\n");
+    if after_text.ends_with('\n') {
+        before.push('\n');
+    }
+    Some(before)
+}
+
+fn build_notebook_semantic_diff(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> NotebookSemanticDiff {
+    let before_activity = before
+        .get("current_activity")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let after_activity = after
+        .get("current_activity")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let activity_change = if before_activity != after_activity {
+        Some((before_activity, after_activity))
+    } else {
+        None
+    };
+
+    NotebookSemanticDiff {
+        display_path: "gugugaga/notebooks".to_string(),
+        activity_change,
+        completed: build_list_diff(before, after, "completed", "what", format_completed_item),
+        attention: build_list_diff(before, after, "attention", "content", format_attention_item),
+        mistakes: build_list_diff(
+            before,
+            after,
+            "mistakes",
+            "what_happened",
+            format_mistake_item,
+        ),
+    }
+}
+
+fn build_list_diff(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    field: &str,
+    identity_key: &str,
+    formatter: fn(&serde_json::Map<String, serde_json::Value>) -> String,
+) -> NotebookListDiff {
+    let before_map = build_notebook_item_map(before, field, identity_key, formatter);
+    let after_map = build_notebook_item_map(after, field, identity_key, formatter);
+
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+
+    for (key, before_value) in &before_map {
+        match after_map.get(key) {
+            None => removed.push(before_value.clone()),
+            Some(after_value) if after_value != before_value => {
+                changed.push((before_value.clone(), after_value.clone()))
+            }
+            _ => {}
+        }
+    }
+
+    for (key, after_value) in &after_map {
+        if !before_map.contains_key(key) {
+            added.push(after_value.clone());
+        }
+    }
+
+    removed.sort();
+    added.sort();
+    changed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    NotebookListDiff {
+        added,
+        removed,
+        changed,
+    }
+}
+
+fn build_notebook_item_map(
+    value: &serde_json::Value,
+    field: &str,
+    identity_key: &str,
+    formatter: fn(&serde_json::Map<String, serde_json::Value>) -> String,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(array) = value.get(field).and_then(serde_json::Value::as_array) else {
+        return out;
+    };
+
+    for (index, item) in array.iter().enumerate() {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let base_key = object
+            .get(identity_key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("#{index}"));
+        let mut key = base_key.clone();
+        let mut duplicate_idx = 1usize;
+        while out.contains_key(&key) {
+            duplicate_idx += 1;
+            key = format!("{base_key}#{duplicate_idx}");
+        }
+        out.insert(key, formatter(object));
+    }
+
+    out
+}
+
+fn string_field(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> String {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_default()
+}
+
+fn format_completed_item(object: &serde_json::Map<String, serde_json::Value>) -> String {
+    let what = string_field(object, "what");
+    let significance = string_field(object, "significance");
+    if significance.is_empty() {
+        what
+    } else {
+        format!("{what} — {significance}")
+    }
+}
+
+fn format_attention_item(object: &serde_json::Map<String, serde_json::Value>) -> String {
+    let content = string_field(object, "content");
+    let source = string_field(object, "source");
+    let priority = string_field(object, "priority");
+    let mut meta = Vec::new();
+    if !source.is_empty() {
+        meta.push(source);
+    }
+    if !priority.is_empty() {
+        meta.push(priority);
+    }
+    if meta.is_empty() {
+        content
+    } else {
+        format!("{content} [{}]", meta.join("/"))
+    }
+}
+
+fn format_mistake_item(object: &serde_json::Map<String, serde_json::Value>) -> String {
+    let what_happened = string_field(object, "what_happened");
+    let lesson = string_field(object, "lesson");
+    if lesson.is_empty() {
+        what_happened
+    } else {
+        format!("{what_happened} -> {lesson}")
+    }
+}
+
 #[derive(Debug)]
 struct CompletedMcpToolCallWithImageOutput {
     _image: DynamicImage,
@@ -2190,6 +2592,29 @@ pub(crate) fn new_patch_apply_failure(stderr: String) -> PlainHistoryCell {
     PlainHistoryCell { lines }
 }
 
+pub(crate) fn new_notebook_patch_status(success: bool, message: String) -> PlainHistoryCell {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if success {
+        lines.push(Line::from(vec![
+            "• ".dim(),
+            "Updated notebook".bold(),
+            " ".into(),
+            "(status)".dim(),
+        ]));
+        lines.push(Line::from(vec![
+            "  └ ".dim(),
+            message.trim().to_string().dim(),
+        ]));
+    } else {
+        lines.push(Line::from("✘ Failed to update notebook".magenta().bold()));
+        lines.push(Line::from(vec![
+            "  └ ".dim(),
+            message.trim().to_string().dim(),
+        ]));
+    }
+    PlainHistoryCell { lines }
+}
+
 pub(crate) fn new_view_image_tool_call(path: PathBuf, cwd: &Path) -> PlainHistoryCell {
     let display_path = display_path_for(&path, cwd);
 
@@ -2416,11 +2841,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::fs;
 
     use codex_protocol::mcp::CallToolResult;
     use codex_protocol::mcp::Tool;
     use codex_protocol::protocol::ExecCommandSource;
+    use codex_protocol::protocol::FileChange;
     use rmcp::model::Content;
+    use tempfile::tempdir;
 
     const SMALL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     async fn test_config() -> Config {
@@ -2446,6 +2874,54 @@ mod tests {
 
     fn render_transcript(cell: &dyn HistoryCell) -> Vec<String> {
         render_lines(&cell.transcript_lines(u16::MAX))
+    }
+
+    fn build_unified_diff(before: &str, after: &str) -> String {
+        let before_lines: Vec<&str> = before.lines().collect();
+        let after_lines: Vec<&str> = after.lines().collect();
+
+        let mut prefix = 0usize;
+        while prefix < before_lines.len()
+            && prefix < after_lines.len()
+            && before_lines[prefix] == after_lines[prefix]
+        {
+            prefix += 1;
+        }
+
+        let mut suffix = 0usize;
+        while suffix < before_lines.len().saturating_sub(prefix)
+            && suffix < after_lines.len().saturating_sub(prefix)
+            && before_lines[before_lines.len() - 1 - suffix]
+                == after_lines[after_lines.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+
+        let old_end = before_lines.len().saturating_sub(suffix);
+        let new_end = after_lines.len().saturating_sub(suffix);
+        let removed = &before_lines[prefix..old_end];
+        let added = &after_lines[prefix..new_end];
+        let old_start = prefix + 1;
+        let new_start = prefix + 1;
+
+        let mut out = format!(
+            "@@ -{},{} +{},{} @@",
+            old_start,
+            removed.len(),
+            new_start,
+            added.len()
+        );
+        for line in removed {
+            out.push('\n');
+            out.push('-');
+            out.push_str(line);
+        }
+        for line in added {
+            out.push('\n');
+            out.push('+');
+            out.push_str(line);
+        }
+        out
     }
 
     fn image_block(data: &str) -> serde_json::Value {
@@ -2474,6 +2950,102 @@ mod tests {
             meta: None,
         }))
         .expect("resource link content should serialize")
+    }
+
+    #[test]
+    fn notebook_patch_event_renders_semantic_field_diff() {
+        let temp = tempdir().expect("tempdir");
+        let notebook_path = temp.path().join("gugugaga/notebooks/thread-1.json");
+        fs::create_dir_all(
+            notebook_path
+                .parent()
+                .expect("notebook path should have a parent"),
+        )
+        .expect("create notebook parent");
+
+        let before = serde_json::to_string_pretty(&json!({
+            "current_activity": "Investigating bug",
+            "completed": [
+                {
+                    "what": "Checked logs",
+                    "significance": "low"
+                }
+            ],
+            "attention": [
+                {
+                    "content": "Need reproduction case",
+                    "source": "user",
+                    "priority": "high"
+                }
+            ],
+            "mistakes": []
+        }))
+        .expect("serialize before")
+            + "\n";
+        let after = serde_json::to_string_pretty(&json!({
+            "current_activity": "Fixing render path",
+            "completed": [
+                {
+                    "what": "Checked logs",
+                    "significance": "low"
+                },
+                {
+                    "what": "Patched render path",
+                    "significance": "high"
+                }
+            ],
+            "attention": [],
+            "mistakes": [
+                {
+                    "what_happened": "Skipped edge case",
+                    "lesson": "Add regression test"
+                }
+            ]
+        }))
+        .expect("serialize after")
+            + "\n";
+
+        fs::write(&notebook_path, after.as_bytes()).expect("write notebook");
+        let unified_diff = build_unified_diff(&before, &after);
+        let mut changes = HashMap::new();
+        changes.insert(
+            notebook_path,
+            FileChange::Update {
+                unified_diff,
+                move_path: None,
+            },
+        );
+
+        let cell = new_notebook_patch_event(&changes, temp.path())
+            .expect("expected notebook semantic patch cell");
+        let rendered = render_lines(&cell.display_lines(180)).join("\n");
+
+        assert!(rendered.contains("Updated notebook"));
+        assert!(rendered.contains("current_activity"));
+        assert!(rendered.contains("Investigating bug"));
+        assert!(rendered.contains("Fixing render path"));
+        assert!(rendered.contains("completed"));
+        assert!(rendered.contains("Patched render path"));
+        assert!(rendered.contains("attention"));
+        assert!(rendered.contains("Need reproduction case [user/high]"));
+        assert!(rendered.contains("mistakes"));
+        assert!(rendered.contains("Skipped edge case -> Add regression test"));
+    }
+
+    #[test]
+    fn notebook_patch_event_ignores_non_notebook_files() {
+        let mut changes = HashMap::new();
+        changes.insert(
+            PathBuf::from("state.json"),
+            FileChange::Update {
+                unified_diff: "@@ -1,1 +1,1 @@\n-{}\n+{}".to_string(),
+                move_path: None,
+            },
+        );
+        assert!(
+            new_notebook_patch_event(&changes, Path::new(".")).is_none(),
+            "non-notebook json paths should use generic patch rendering"
+        );
     }
 
     #[test]

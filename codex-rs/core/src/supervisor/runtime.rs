@@ -130,6 +130,22 @@ impl SupervisorDecision {
             "gugugaga supervisor violation {violation_type}: {description}. correction: {correction}"
         ))
     }
+
+    fn correction_for_codex(&self) -> Option<String> {
+        if !self.result.eq_ignore_ascii_case("violation") {
+            return None;
+        }
+        self.correction
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn correction_user_message(&self) -> Option<String> {
+        self.correction_for_codex()
+            .map(|correction| format!("🛡️ Corrected: {correction}"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +220,8 @@ impl NotebookValidationReport {
 pub(crate) struct SupervisorAfterAgentOutcome {
     pub(crate) warning_message: Option<String>,
     pub(crate) user_ack_message: Option<String>,
+    pub(crate) correction_user_message: Option<String>,
+    pub(crate) correction_to_codex: Option<String>,
     pub(crate) events: Vec<EventMsg>,
 }
 
@@ -305,6 +323,8 @@ impl SupervisorRuntime {
         let mut review_summary = assistant_summary;
         let mut notebook_changed_by_tools = false;
         let mut violation_note = None;
+        let mut correction_to_codex = None;
+        let mut correction_user_message = None;
         let mut ui_events = Vec::new();
 
         if let (Some(tc), Some(client), Some(assistant_message)) =
@@ -318,6 +338,8 @@ impl SupervisorRuntime {
                     review_summary = pass.decision.summary.clone();
                     notebook_changed_by_tools = pass.notebook_changed;
                     violation_note = pass.decision.warning_message();
+                    correction_to_codex = pass.decision.correction_for_codex();
+                    correction_user_message = pass.decision.correction_user_message();
                     ui_events = pass.ui_events;
                 }
                 Err(err) => {
@@ -330,7 +352,11 @@ impl SupervisorRuntime {
             }
         }
 
-        let user_ack_message = Some(format_turn_ack_message(review_summary.as_str()));
+        let user_ack_message = if correction_to_codex.is_some() {
+            None
+        } else {
+            Some(format_turn_ack_message(review_summary.as_str()))
+        };
 
         if !notebook_changed_by_tools {
             let mut notebook = self.notebook.lock().await;
@@ -344,11 +370,18 @@ impl SupervisorRuntime {
             self.persist_notebook(&snapshot).await;
         }
 
-        let warning_message = violation_note;
+        // Keep warning output as a fallback when no actionable correction is available.
+        let warning_message = if correction_to_codex.is_some() {
+            None
+        } else {
+            violation_note
+        };
 
         Some(SupervisorAfterAgentOutcome {
             warning_message,
             user_ack_message,
+            correction_user_message,
+            correction_to_codex,
             events: ui_events,
         })
     }
@@ -778,7 +811,7 @@ impl SupervisorRuntime {
         for tool_call in tool_calls {
             turn_items.push(tool_call.item.clone());
             let signature = format!("{}::{}", tool_call.tool_name, tool_call.arguments);
-            let mut command = vec!["gugugaga/tool".to_string(), tool_call.tool_name.clone()];
+            let mut command = supervisor_tool_display_prefix(tool_call.tool_name.as_str());
             let tool_call_id = format!("gugugaga-supervisor-{round}-{}", tool_call.call_id);
             let turn_id = turn_context.sub_id.clone();
             let cwd = turn_context.cwd.clone();
@@ -931,13 +964,45 @@ impl SupervisorRuntime {
                 continue;
             }
 
+            if tool_call.tool_name == "apply_patch_notebook"
+                && let Some((summary, patch_success, patch_status)) =
+                    notebook_patch_status_from_output(output.as_str())
+            {
+                if patch_success && summary.contains("Applied") {
+                    *notebook_changed = true;
+                }
+                ui_events.push(EventMsg::PatchApplyEnd(PatchApplyEndEvent {
+                    call_id: tool_call_id,
+                    turn_id,
+                    stdout: summary.clone(),
+                    stderr: if patch_success {
+                        String::new()
+                    } else {
+                        summary
+                    },
+                    success: patch_success,
+                    changes: HashMap::new(),
+                    status: patch_status,
+                }));
+                turn_items.push(ResponseItem::FunctionCallOutput {
+                    call_id: tool_call.call_id.clone(),
+                    output: FunctionCallOutputPayload::from_text(output),
+                });
+                continue;
+            }
+
             let args_preview = tool_args_preview(args_for_display.as_str());
             if !args_preview.is_empty() {
                 command.push(args_preview);
             }
-            let parsed_cmd = vec![ParsedCommand::Unknown {
-                cmd: command.join(" "),
-            }];
+            let parsed_cmd = supervisor_tool_parsed_command(
+                tool_call.tool_name.as_str(),
+                args_for_display.as_str(),
+                cwd.as_path(),
+                self.notebook_path.as_ref(),
+                success,
+                command.as_slice(),
+            );
             ui_events.push(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                 call_id: tool_call_id.clone(),
                 process_id: None,
@@ -2639,6 +2704,113 @@ fn tool_args_preview(args: &str) -> String {
     truncate_text(compact.as_str(), 180, "")
 }
 
+fn supervisor_tool_display_prefix(tool_name: &str) -> Vec<String> {
+    match tool_name {
+        "read_notebook" => vec!["gugugaga/notebook".to_string(), "read".to_string()],
+        "apply_patch_notebook" => vec!["gugugaga/notebook".to_string(), "patch".to_string()],
+        "search_history" => vec!["gugugaga/history".to_string(), "search".to_string()],
+        "read_recent" => vec!["gugugaga/history".to_string(), "read_recent".to_string()],
+        "read_turn" => vec!["gugugaga/history".to_string(), "read_turn".to_string()],
+        "history_stats" => vec!["gugugaga/history".to_string(), "stats".to_string()],
+        "read_file" => vec!["gugugaga/fs".to_string(), "read".to_string()],
+        "glob" => vec!["gugugaga/fs".to_string(), "glob".to_string()],
+        "ls" => vec!["gugugaga/fs".to_string(), "list".to_string()],
+        "rg" => vec!["gugugaga/fs".to_string(), "search".to_string()],
+        "shell" => vec!["gugugaga/fs".to_string(), "shell".to_string()],
+        _ => vec!["gugugaga/tool".to_string(), tool_name.to_string()],
+    }
+}
+
+fn supervisor_tool_parsed_command(
+    tool_name: &str,
+    args: &str,
+    cwd: &Path,
+    notebook_path: Option<&PathBuf>,
+    success: bool,
+    command: &[String],
+) -> Vec<ParsedCommand> {
+    let unknown = || {
+        vec![ParsedCommand::Unknown {
+            cmd: command.join(" "),
+        }]
+    };
+
+    if !success {
+        return unknown();
+    }
+
+    match tool_name {
+        "read_notebook" => {
+            let path = notebook_path
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("gugugaga/notebook.json"));
+            vec![ParsedCommand::Read {
+                cmd: "read_notebook".to_string(),
+                name: "notebook".to_string(),
+                path,
+            }]
+        }
+        "read_file" => {
+            let path_text = args.split('|').next().unwrap_or_default().trim();
+            if path_text.is_empty() {
+                return unknown();
+            }
+            let path_buf = PathBuf::from(path_text);
+            let path = if path_buf.is_absolute() {
+                path_buf
+            } else {
+                cwd.join(path_buf)
+            };
+            vec![ParsedCommand::Read {
+                cmd: "read_file".to_string(),
+                name: path_text.to_string(),
+                path,
+            }]
+        }
+        "search_history" => vec![ParsedCommand::Search {
+            cmd: "search_history".to_string(),
+            query: if args.trim().is_empty() {
+                None
+            } else {
+                Some(args.to_string())
+            },
+            path: Some("history".to_string()),
+        }],
+        "rg" => vec![ParsedCommand::Search {
+            cmd: "rg".to_string(),
+            query: if args.trim().is_empty() {
+                None
+            } else {
+                Some(args.to_string())
+            },
+            path: None,
+        }],
+        "glob" | "ls" => vec![ParsedCommand::ListFiles {
+            cmd: tool_name.to_string(),
+            path: if args.trim().is_empty() {
+                None
+            } else {
+                Some(args.to_string())
+            },
+        }],
+        _ => unknown(),
+    }
+}
+
+fn notebook_patch_status_from_output(output: &str) -> Option<(String, bool, PatchApplyStatus)> {
+    let summary = output.lines().next()?.trim();
+    if !summary.starts_with("apply_patch_notebook:") {
+        return None;
+    }
+
+    let detail = summary.trim_start_matches("apply_patch_notebook:").trim();
+    if detail.starts_with("Applied") || detail == "No changes applied" {
+        Some((summary.to_string(), true, PatchApplyStatus::Completed))
+    } else {
+        Some((summary.to_string(), false, PatchApplyStatus::Failed))
+    }
+}
+
 fn supervisor_enabled_from_env() -> bool {
     match std::env::var(SUPERVISOR_ENV_VAR) {
         Ok(value) => !matches!(
@@ -2707,6 +2879,35 @@ mod tests {
 
         assert_eq!(outcome.warning_message, None);
         assert_eq!(outcome.user_ack_message, Some("🛡️ world".to_string()));
+        assert_eq!(outcome.correction_user_message, None);
+        assert_eq!(outcome.correction_to_codex, None);
+    }
+
+    #[test]
+    fn violation_decision_extracts_correction_for_codex() {
+        let decision = SupervisorDecision {
+            result: "violation".to_string(),
+            summary: "ignored instruction".to_string(),
+            violation_type: Some("IGNORED_INSTRUCTION".to_string()),
+            description: Some("Codex ignored user instruction".to_string()),
+            correction: Some("  Follow the explicit user instruction first.  ".to_string()),
+        };
+
+        assert_eq!(
+            decision.correction_for_codex(),
+            Some("Follow the explicit user instruction first.".to_string())
+        );
+        assert_eq!(
+            decision.correction_user_message(),
+            Some("🛡️ Corrected: Follow the explicit user instruction first.".to_string())
+        );
+    }
+
+    #[test]
+    fn ok_decision_does_not_emit_correction() {
+        let decision = SupervisorDecision::ok("looks good".to_string());
+        assert_eq!(decision.correction_for_codex(), None);
+        assert_eq!(decision.correction_user_message(), None);
     }
 
     #[test]
@@ -2782,6 +2983,55 @@ mod tests {
         let normalized =
             SupervisorRuntime::normalize_tool_arguments("read_notebook", "{}").expect("normalize");
         assert!(normalized.is_empty());
+    }
+
+    #[test]
+    fn supervisor_tool_display_prefix_uses_notebook_friendly_name() {
+        assert_eq!(
+            supervisor_tool_display_prefix("apply_patch_notebook"),
+            vec!["gugugaga/notebook".to_string(), "patch".to_string()]
+        );
+    }
+
+    #[test]
+    fn supervisor_tool_parsed_command_maps_read_notebook_to_read() {
+        let path = PathBuf::from("/tmp/notebook.json");
+        let parsed = supervisor_tool_parsed_command(
+            "read_notebook",
+            "",
+            Path::new("/tmp"),
+            Some(&path),
+            true,
+            &["gugugaga/notebook".to_string(), "read".to_string()],
+        );
+        assert_eq!(
+            parsed,
+            vec![ParsedCommand::Read {
+                cmd: "read_notebook".to_string(),
+                name: "notebook".to_string(),
+                path,
+            }]
+        );
+    }
+
+    #[test]
+    fn notebook_patch_status_from_output_maps_no_changes_to_success() {
+        let parsed = notebook_patch_status_from_output("apply_patch_notebook: No changes applied")
+            .expect("expected status");
+        assert_eq!(parsed.0, "apply_patch_notebook: No changes applied");
+        assert!(parsed.1);
+        assert_eq!(parsed.2, PatchApplyStatus::Completed);
+    }
+
+    #[test]
+    fn notebook_patch_status_from_output_maps_validation_to_failure() {
+        let parsed = notebook_patch_status_from_output(
+            "apply_patch_notebook: Validation failed\n- $.completed[0]: invalid item type",
+        )
+        .expect("expected status");
+        assert_eq!(parsed.0, "apply_patch_notebook: Validation failed");
+        assert!(!parsed.1);
+        assert_eq!(parsed.2, PatchApplyStatus::Failed);
     }
 
     #[test]
