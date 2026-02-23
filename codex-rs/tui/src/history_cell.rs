@@ -1520,8 +1520,15 @@ pub(crate) fn new_user_to_gugugaga_prompt(message: String) -> PrefixedWrappedHis
 }
 
 pub(crate) fn new_gugugaga_message(message: String) -> PrefixedWrappedHistoryCell {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    append_markdown(&message, None, &mut lines);
+    let text = if lines.is_empty() {
+        Text::from(message)
+    } else {
+        Text::from(lines)
+    };
     PrefixedWrappedHistoryCell::new(
-        Text::from(message),
+        text,
         Line::from(vec!["▎".magenta(), " ".into()]),
         Line::from(vec!["▎".magenta(), " ".into()]),
     )
@@ -2950,6 +2957,18 @@ mod tests {
             meta: None,
         }))
         .expect("resource link content should serialize")
+    }
+
+    #[test]
+    fn gugugaga_message_renders_markdown_content() {
+        let cell = new_gugugaga_message(
+            "**Bold** supervisor reply with `code` and [link](https://example.com)".to_string(),
+        );
+        let rendered = render_lines(&cell.display_lines(200)).join("\n");
+        assert!(rendered.contains("Bold supervisor reply with code and link"));
+        assert!(!rendered.contains("**Bold**"));
+        assert!(!rendered.contains("`code`"));
+        assert!(!rendered.contains("[link](https://example.com)"));
     }
 
     #[test]
