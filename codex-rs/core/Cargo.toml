@@ -58,6 +58,7 @@ env-flags = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+ignore = { workspace = true }
 indexmap = { workspace = true }
 indoc = { workspace = true }
 keyring = { workspace = true, features = ["crypto-rust"] }

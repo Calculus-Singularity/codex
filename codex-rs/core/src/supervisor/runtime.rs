@@ -155,6 +155,12 @@ struct SupervisorPassResult {
     ui_events: Vec<EventMsg>,
 }
 
+struct SupervisorLoopResult {
+    response_text: String,
+    notebook_changed: bool,
+    ui_events: Vec<EventMsg>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct NotebookSnapshot {
     raw: String,
@@ -509,140 +515,28 @@ impl SupervisorRuntime {
             return Err("user message is empty".to_string());
         }
 
-        let mut client_session = model_client.new_session();
-        let mut turn_items: Vec<ResponseItem> = Vec::new();
-        let mut executed_tool_signatures: HashSet<String> = HashSet::new();
-        let mut executed_tool_calls: usize = 0;
-        let mut notebook_changed = false;
-        let mut ui_events: Vec<EventMsg> = Vec::new();
-        let turn_metadata_header = turn_context.turn_metadata_state.current_header_value();
-
-        let reply = loop {
-            let round = (ui_events
-                .iter()
-                .filter(|event| matches!(event, EventMsg::BackgroundEvent(_)))
-                .count() as u32)
-                + 1;
-            if round > MAX_SUPERVISOR_FOLLOW_UP_ROUNDS {
-                break "I reached the tool follow-up guard limit for this chat turn. Please restate the key point and I will continue concisely.".to_string();
-            }
-
-            let round_message = if round == 1 {
-                "Supervising: Thinking...".to_string()
-            } else {
-                format!("Supervising: Thinking (tool follow-up #{})...", round - 1)
-            };
-            ui_events.push(EventMsg::BackgroundEvent(BackgroundEventEvent {
-                message: round_message,
-            }));
-
-            let notebook_text = self.read_notebook_raw().await;
-            let history_excerpt = self.build_recent_history_excerpt(16).await;
-            let prompt_text = build_supervisor_chat_prompt(
-                user_message,
-                notebook_text.as_str(),
-                history_excerpt.as_str(),
-            );
-
-            let mut input = vec![ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText { text: prompt_text }],
-                end_turn: None,
-                phase: None,
-            }];
-            input.extend(turn_items.clone());
-
-            let prompt = Prompt {
-                input,
-                tools: supervisor_tools_schema(),
-                parallel_tool_calls: false,
-                base_instructions: BaseInstructions {
-                    text: SUPERVISOR_CHAT_BASE_INSTRUCTIONS.to_string(),
-                },
-                personality: None,
-                output_schema: None,
-            };
-
-            let mut stream = tokio::time::timeout(
-                SUPERVISOR_STREAM_TIMEOUT,
-                client_session.stream(
-                    &prompt,
-                    &turn_context.model_info,
-                    &turn_context.otel_manager,
-                    Some(ReasoningEffortConfig::Low),
-                    turn_context.reasoning_summary,
-                    turn_metadata_header.as_deref(),
-                ),
-            )
-            .await
-            .map_err(|_| {
-                format!("supervisor chat stream start timed out in follow-up round {round}")
-            })?
-            .map_err(|err| format!("supervisor chat stream setup failed: {err}"))?;
-
-            let mut response_text = String::new();
-            let mut output_items = Vec::new();
-            let mut completed = false;
-
-            loop {
-                let maybe_event = tokio::time::timeout(SUPERVISOR_STREAM_TIMEOUT, stream.next())
-                    .await
-                    .map_err(|_| {
-                        format!("supervisor chat stream timed out in follow-up round {round}")
-                    })?;
-                let Some(event) = maybe_event else {
-                    break;
-                };
-
-                match event.map_err(|err| format!("supervisor chat stream error: {err}"))? {
-                    ResponseEvent::OutputTextDelta(delta) => response_text.push_str(&delta),
-                    ResponseEvent::OutputItemDone(item) => {
-                        if response_text.is_empty()
-                            && let Some(text) = extract_response_item_text(&item)
-                        {
-                            response_text.push_str(&text);
-                        }
-                        output_items.push(item);
-                    }
-                    ResponseEvent::Completed { .. } => {
-                        completed = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            if !completed {
-                return Err(format!(
-                    "supervisor chat stream closed before completion in follow-up round {round}"
-                ));
-            }
-
-            let tool_calls = extract_structured_tool_calls(&output_items);
-            if tool_calls.is_empty() {
-                break normalize_supervisor_chat_reply(response_text.as_str());
-            }
-
-            self.execute_structured_tool_calls_for_round(
+        let result = self
+            .run_supervisor_loop(
                 turn_context,
-                round,
-                &tool_calls,
-                &mut turn_items,
-                &mut executed_tool_signatures,
-                &mut executed_tool_calls,
-                &mut notebook_changed,
-                &mut ui_events,
+                model_client,
+                SUPERVISOR_CHAT_BASE_INSTRUCTIONS,
+                "Thinking",
+                16,
+                "I reached the tool follow-up guard limit for this chat turn. Please restate the key point and I will continue concisely.",
+                |notebook, history| {
+                    build_supervisor_chat_prompt(user_message, notebook, history)
+                },
             )
-            .await;
-        };
+            .await?;
+
+        let reply = normalize_supervisor_chat_reply(result.response_text.as_str());
         self.append_history_turn("user_to_guga_codex", user_message)
             .await;
         self.append_history_turn("guga-codex", reply.as_str()).await;
         Ok(SupervisorChatOutcome {
             reply,
-            events: ui_events,
-            notebook_changed,
+            events: result.ui_events,
+            notebook_changed: result.notebook_changed,
         })
     }
 
@@ -663,6 +557,54 @@ impl SupervisorRuntime {
             });
         }
 
+        let result = self
+            .run_supervisor_loop(
+                turn_context,
+                model_client,
+                SUPERVISOR_BASE_INSTRUCTIONS,
+                "Analyzing completed turn",
+                12,
+                "",
+                |notebook, history| {
+                    build_supervisor_prompt(
+                        input_messages,
+                        last_assistant_message,
+                        notebook,
+                        history,
+                    )
+                },
+            )
+            .await?;
+
+        let decision = if result.response_text.is_empty() {
+            SupervisorDecision::ok(
+                "Supervisor reached follow-up guard limit and returned conservative OK."
+                    .to_string(),
+            )
+        } else {
+            parse_supervisor_decision(&result.response_text)
+        };
+
+        Ok(SupervisorPassResult {
+            decision,
+            notebook_changed: result.notebook_changed,
+            ui_events: result.ui_events,
+        })
+    }
+
+    async fn run_supervisor_loop<F>(
+        &self,
+        turn_context: &TurnContext,
+        model_client: &ModelClient,
+        base_instructions: &str,
+        status_prefix: &str,
+        history_excerpt_limit: usize,
+        guard_limit_fallback: &str,
+        build_prompt_text: F,
+    ) -> Result<SupervisorLoopResult, String>
+    where
+        F: Fn(&str, &str) -> String,
+    {
         let mut client_session = model_client.new_session();
         let mut turn_items: Vec<ResponseItem> = Vec::new();
         let mut executed_tool_signatures: HashSet<String> = HashSet::new();
@@ -673,22 +615,23 @@ impl SupervisorRuntime {
 
         for round in 1..=MAX_SUPERVISOR_FOLLOW_UP_ROUNDS {
             let round_message = if round == 1 {
-                "Supervising: Analyzing completed turn...".to_string()
+                format!("Supervising: {status_prefix}...")
             } else {
-                format!("Supervising: Analyzing (tool follow-up #{})...", round - 1)
+                format!(
+                    "Supervising: {status_prefix} (tool follow-up #{})...",
+                    round - 1
+                )
             };
             ui_events.push(EventMsg::BackgroundEvent(BackgroundEventEvent {
                 message: round_message,
             }));
 
             let notebook_text = self.read_notebook_raw().await;
-            let history_excerpt = self.build_recent_history_excerpt(12).await;
-            let prompt_text = build_supervisor_prompt(
-                input_messages,
-                last_assistant_message,
-                notebook_text.as_str(),
-                history_excerpt.as_str(),
-            );
+            let history_excerpt = self
+                .build_recent_history_excerpt(history_excerpt_limit)
+                .await;
+            let prompt_text =
+                build_prompt_text(notebook_text.as_str(), history_excerpt.as_str());
 
             let mut input = vec![ResponseItem::Message {
                 id: None,
@@ -704,7 +647,7 @@ impl SupervisorRuntime {
                 tools: supervisor_tools_schema(),
                 parallel_tool_calls: false,
                 base_instructions: BaseInstructions {
-                    text: SUPERVISOR_BASE_INSTRUCTIONS.to_string(),
+                    text: base_instructions.to_string(),
                 },
                 personality: None,
                 output_schema: None,
@@ -722,7 +665,7 @@ impl SupervisorRuntime {
                 ),
             )
             .await
-            .map_err(|_| format!("supervisor stream start timed out in follow-up round {round}"))?
+            .map_err(|_| format!("supervisor stream timed out starting round {round}"))?
             .map_err(|err| format!("supervisor stream setup failed: {err}"))?;
 
             let mut response_text = String::new();
@@ -730,18 +673,22 @@ impl SupervisorRuntime {
             let mut completed = false;
 
             loop {
-                let maybe_event = tokio::time::timeout(SUPERVISOR_STREAM_TIMEOUT, stream.next())
-                    .await
-                    .map_err(|_| {
-                        format!("supervisor stream timed out in follow-up round {round}")
-                    })?;
-
+                let maybe_event =
+                    tokio::time::timeout(SUPERVISOR_STREAM_TIMEOUT, stream.next())
+                        .await
+                        .map_err(|_| {
+                            format!("supervisor stream timed out in round {round}")
+                        })?;
                 let Some(event) = maybe_event else {
                     break;
                 };
 
-                match event.map_err(|err| format!("supervisor stream error: {err}"))? {
-                    ResponseEvent::OutputTextDelta(delta) => response_text.push_str(&delta),
+                match event
+                    .map_err(|err| format!("supervisor stream error: {err}"))?
+                {
+                    ResponseEvent::OutputTextDelta(delta) => {
+                        response_text.push_str(&delta)
+                    }
                     ResponseEvent::OutputItemDone(item) => {
                         if response_text.is_empty()
                             && let Some(text) = extract_response_item_text(&item)
@@ -760,15 +707,14 @@ impl SupervisorRuntime {
 
             if !completed {
                 return Err(format!(
-                    "supervisor stream closed before completion in follow-up round {round}"
+                    "supervisor stream closed before completion in round {round}"
                 ));
             }
 
             let tool_calls = extract_structured_tool_calls(&output_items);
             if tool_calls.is_empty() {
-                let decision = parse_supervisor_decision(&response_text);
-                return Ok(SupervisorPassResult {
-                    decision,
+                return Ok(SupervisorLoopResult {
+                    response_text,
                     notebook_changed,
                     ui_events,
                 });
@@ -787,11 +733,8 @@ impl SupervisorRuntime {
             .await;
         }
 
-        Ok(SupervisorPassResult {
-            decision: SupervisorDecision::ok(
-                "Supervisor reached follow-up guard limit and returned conservative OK."
-                    .to_string(),
-            ),
+        Ok(SupervisorLoopResult {
+            response_text: guard_limit_fallback.to_string(),
             notebook_changed,
             ui_events,
         })
@@ -817,88 +760,34 @@ impl SupervisorRuntime {
             let cwd = turn_context.cwd.clone();
 
             if !executed_tool_signatures.insert(signature) {
-                let output = "duplicate tool call skipped in same turn".to_string();
-                let args_preview = tool_args_preview(tool_call.arguments.as_str());
-                if !args_preview.is_empty() {
-                    command.push(args_preview);
-                }
-                let parsed_cmd = vec![ParsedCommand::Unknown {
-                    cmd: command.join(" "),
-                }];
-                ui_events.push(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
-                    call_id: tool_call_id.clone(),
-                    process_id: None,
-                    turn_id: turn_id.clone(),
-                    command: command.clone(),
-                    cwd: cwd.clone(),
-                    parsed_cmd: parsed_cmd.clone(),
-                    source: ExecCommandSource::Agent,
-                    interaction_input: None,
-                }));
-                ui_events.push(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-                    call_id: tool_call_id,
-                    process_id: None,
-                    turn_id,
-                    command,
-                    cwd,
-                    parsed_cmd,
-                    source: ExecCommandSource::Agent,
-                    interaction_input: None,
-                    stdout: String::new(),
-                    stderr: output.clone(),
-                    aggregated_output: output.clone(),
-                    exit_code: 1,
-                    duration: Duration::from_millis(0),
-                    formatted_output: output.clone(),
-                    status: ExecCommandStatus::Failed,
-                }));
-                turn_items.push(ResponseItem::FunctionCallOutput {
-                    call_id: tool_call.call_id.clone(),
-                    output: FunctionCallOutputPayload::from_text(output),
-                });
+                let (begin, end, call_output) = build_rejected_tool_call_events(
+                    &tool_call_id,
+                    &turn_id,
+                    &cwd,
+                    &mut command,
+                    tool_call.arguments.as_str(),
+                    &tool_call.call_id,
+                    "duplicate tool call skipped in same turn",
+                );
+                ui_events.push(begin);
+                ui_events.push(end);
+                turn_items.push(call_output);
                 continue;
             }
 
             if *executed_tool_calls >= MAX_SUPERVISOR_TOOL_CALLS {
-                let output = "tool-call limit reached for this turn".to_string();
-                let args_preview = tool_args_preview(tool_call.arguments.as_str());
-                if !args_preview.is_empty() {
-                    command.push(args_preview);
-                }
-                let parsed_cmd = vec![ParsedCommand::Unknown {
-                    cmd: command.join(" "),
-                }];
-                ui_events.push(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
-                    call_id: tool_call_id.clone(),
-                    process_id: None,
-                    turn_id: turn_id.clone(),
-                    command: command.clone(),
-                    cwd: cwd.clone(),
-                    parsed_cmd: parsed_cmd.clone(),
-                    source: ExecCommandSource::Agent,
-                    interaction_input: None,
-                }));
-                ui_events.push(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-                    call_id: tool_call_id,
-                    process_id: None,
-                    turn_id,
-                    command,
-                    cwd,
-                    parsed_cmd,
-                    source: ExecCommandSource::Agent,
-                    interaction_input: None,
-                    stdout: String::new(),
-                    stderr: output.clone(),
-                    aggregated_output: output.clone(),
-                    exit_code: 1,
-                    duration: Duration::from_millis(0),
-                    formatted_output: output.clone(),
-                    status: ExecCommandStatus::Failed,
-                }));
-                turn_items.push(ResponseItem::FunctionCallOutput {
-                    call_id: tool_call.call_id.clone(),
-                    output: FunctionCallOutputPayload::from_text(output),
-                });
+                let (begin, end, call_output) = build_rejected_tool_call_events(
+                    &tool_call_id,
+                    &turn_id,
+                    &cwd,
+                    &mut command,
+                    tool_call.arguments.as_str(),
+                    &tool_call.call_id,
+                    "tool-call limit reached for this turn",
+                );
+                ui_events.push(begin);
+                ui_events.push(end);
+                turn_items.push(call_output);
                 continue;
             }
 
@@ -1131,11 +1020,12 @@ impl SupervisorRuntime {
                 let path = pick_str(&["path"]).ok_or_else(|| "missing path".to_string())?;
                 let offset = pick_usize(&["offset"]).unwrap_or(1);
                 let limit = pick_usize(&["limit"]).unwrap_or(100);
-                if value.get("offset").is_some() || value.get("limit").is_some() {
-                    Ok(format!("{path}|{offset}|{limit}"))
-                } else {
-                    Ok(path)
-                }
+                Ok(serde_json::json!({
+                    "path": path,
+                    "offset": offset,
+                    "limit": limit,
+                })
+                .to_string())
             }
             "glob" => pick_str(&["pattern"]).ok_or_else(|| "missing pattern".to_string()),
             "shell" => pick_str(&["cmd", "command"]).ok_or_else(|| "missing cmd".to_string()),
@@ -1186,20 +1076,31 @@ impl SupervisorRuntime {
             }
             "apply_patch_notebook" => self.handle_apply_patch_notebook(args).await,
             "read_file" => {
-                let parts: Vec<&str> = args.splitn(3, '|').collect();
-                let path = parts.first().copied().unwrap_or_default().trim();
-                let offset = parts
-                    .get(1)
-                    .and_then(|s| s.trim().parse::<usize>().ok())
-                    .unwrap_or(1);
-                let limit = parts
-                    .get(2)
-                    .and_then(|s| s.trim().parse::<usize>().ok())
-                    .unwrap_or(100);
+                #[derive(Deserialize)]
+                struct ReadFileArgs {
+                    path: String,
+                    #[serde(default = "read_file_default_offset")]
+                    offset: usize,
+                    #[serde(default = "read_file_default_limit")]
+                    limit: usize,
+                }
+                fn read_file_default_offset() -> usize { 1 }
+                fn read_file_default_limit() -> usize { 100 }
 
-                match Self::read_file_lines(cwd, path, offset, limit).await {
-                    Ok(content) => format!("read_file(\"{path}\", {offset}, {limit}):\n{content}"),
-                    Err(e) => format!("read_file(\"{path}\"): Error: {e}"),
+                let parsed: ReadFileArgs = serde_json::from_str(args)
+                    .map_err(|e| format!("read_file: invalid args: {e}"))
+                    .unwrap_or(ReadFileArgs {
+                        path: args.to_string(),
+                        offset: 1,
+                        limit: 100,
+                    });
+
+                match Self::read_file_lines(cwd, &parsed.path, parsed.offset, parsed.limit).await {
+                    Ok(content) => format!(
+                        "read_file(\"{}\", {}, {}):\n{content}",
+                        parsed.path, parsed.offset, parsed.limit
+                    ),
+                    Err(e) => format!("read_file(\"{}\"): Error: {e}", parsed.path),
                 }
             }
             "glob" => match Self::glob_files(cwd, args).await {
@@ -1293,18 +1194,16 @@ impl SupervisorRuntime {
             return Err("empty command".to_string());
         }
 
-        let program = std::path::Path::new(parts[0].as_str())
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(parts[0].as_str());
-
-        if !Self::is_safe_command(program, &parts) {
+        if !crate::is_safe_command::is_known_safe_command(&parts) {
+            let program = std::path::Path::new(parts[0].as_str())
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(parts[0].as_str());
             return Err(format!("Command '{program}' is not in the safe whitelist"));
         }
 
-        let output = Command::new("sh")
-            .arg("-lc")
-            .arg(cmd)
+        let output = Command::new(&parts[0])
+            .args(&parts[1..])
             .current_dir(cwd)
             .output()
             .await
@@ -1331,50 +1230,6 @@ impl SupervisorRuntime {
         }
 
         Ok(result)
-    }
-
-    fn is_safe_command(program: &str, args: &[String]) -> bool {
-        match program {
-            "cat" | "cd" | "cut" | "echo" | "expr" | "false" | "grep" | "head" | "id" | "ls"
-            | "nl" | "paste" | "pwd" | "rev" | "seq" | "stat" | "tail" | "tr" | "true"
-            | "uname" | "uniq" | "wc" | "which" | "whoami" => true,
-            "numfmt" | "tac" => cfg!(target_os = "linux"),
-            "base64" => !args.iter().any(|arg| {
-                arg == "--output" || arg.starts_with("--output=") || arg.starts_with("-o")
-            }),
-            "find" => {
-                let unsafe_opts = [
-                    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0",
-                    "-fprintf",
-                ];
-                !args.iter().any(|arg| unsafe_opts.contains(&arg.as_str()))
-            }
-            "rg" => !args.iter().any(|arg| {
-                arg == "--search-zip"
-                    || arg == "-z"
-                    || arg == "--pre"
-                    || arg.starts_with("--pre=")
-                    || arg == "--hostname-bin"
-                    || arg.starts_with("--hostname-bin=")
-            }),
-            "git" => matches!(
-                args.get(1).map(String::as_str),
-                Some("branch") | Some("status") | Some("log") | Some("diff") | Some("show")
-            ),
-            "cargo" => matches!(args.get(1).map(String::as_str), Some("check")),
-            "sed" => {
-                args.len() <= 4
-                    && args.get(1).map(String::as_str) == Some("-n")
-                    && args.get(2).is_some_and(|arg| {
-                        arg.ends_with('p')
-                            && arg
-                                .trim_end_matches('p')
-                                .chars()
-                                .all(|c| c.is_ascii_digit() || c == ',')
-                    })
-            }
-            _ => false,
-        }
     }
 
     async fn handle_apply_patch_notebook(&self, patch: &str) -> String {
@@ -2571,42 +2426,43 @@ fn glob_files_blocking(cwd: &Path, pattern: &str) -> Result<Vec<PathBuf>, String
 
     let matcher = WildMatch::new(pattern);
     let pattern_no_slash = !pattern.contains('/');
-    let mut stack = vec![cwd.to_path_buf()];
     let mut matches = Vec::new();
     let mut visited = 0usize;
 
-    while let Some(dir) = stack.pop() {
-        let read_dir = std::fs::read_dir(&dir).map_err(|e| format!("read_dir failed: {e}"))?;
-        for entry in read_dir {
-            let entry = entry.map_err(|e| format!("read_dir entry failed: {e}"))?;
-            let path = entry.path();
-            visited += 1;
-            if visited > MAX_GLOB_VISITS {
-                return Err(format!(
-                    "glob scan exceeded {MAX_GLOB_VISITS} filesystem entries"
-                ));
-            }
+    let walker = ignore::WalkBuilder::new(cwd)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
 
-            let rel = path.strip_prefix(cwd).unwrap_or(path.as_path());
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            let abs_str = path.to_string_lossy().replace('\\', "/");
+    for entry in walker {
+        let entry = entry.map_err(|e| format!("walk error: {e}"))?;
+        let path = entry.path();
+        visited += 1;
+        if visited > MAX_GLOB_VISITS {
+            break;
+        }
 
-            let filename_match = pattern_no_slash
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| matcher.matches(name));
+        if path == cwd {
+            continue;
+        }
 
-            if matcher.matches(rel_str.as_str())
-                || matcher.matches(abs_str.as_str())
-                || filename_match
-            {
-                matches.push(path.clone());
-            }
+        let rel = path.strip_prefix(cwd).unwrap_or(path);
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let abs_str = path.to_string_lossy().replace('\\', "/");
 
-            if path.is_dir() {
-                stack.push(path);
-            }
+        let filename_match = pattern_no_slash
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| matcher.matches(name));
+
+        if matcher.matches(rel_str.as_ref())
+            || matcher.matches(abs_str.as_ref())
+            || filename_match
+        {
+            matches.push(path.to_path_buf());
         }
     }
 
@@ -2702,6 +2558,57 @@ fn truncate_text(input: &str, limit: usize, fallback: &str) -> String {
 fn tool_args_preview(args: &str) -> String {
     let compact = args.trim().replace('\n', "\\n");
     truncate_text(compact.as_str(), 180, "")
+}
+
+fn build_rejected_tool_call_events(
+    tool_call_id: &str,
+    turn_id: &str,
+    cwd: &Path,
+    command: &mut Vec<String>,
+    raw_args: &str,
+    original_call_id: &str,
+    reason: &str,
+) -> (EventMsg, EventMsg, ResponseItem) {
+    let output = reason.to_string();
+    let args_preview = tool_args_preview(raw_args);
+    if !args_preview.is_empty() {
+        command.push(args_preview);
+    }
+    let parsed_cmd = vec![ParsedCommand::Unknown {
+        cmd: command.join(" "),
+    }];
+    let begin = EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+        call_id: tool_call_id.to_string(),
+        process_id: None,
+        turn_id: turn_id.to_string(),
+        command: command.clone(),
+        cwd: cwd.to_path_buf(),
+        parsed_cmd: parsed_cmd.clone(),
+        source: ExecCommandSource::Agent,
+        interaction_input: None,
+    });
+    let end = EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+        call_id: tool_call_id.to_string(),
+        process_id: None,
+        turn_id: turn_id.to_string(),
+        command: command.clone(),
+        cwd: cwd.to_path_buf(),
+        parsed_cmd,
+        source: ExecCommandSource::Agent,
+        interaction_input: None,
+        stdout: String::new(),
+        stderr: output.clone(),
+        aggregated_output: output.clone(),
+        exit_code: 1,
+        duration: Duration::from_millis(0),
+        formatted_output: output.clone(),
+        status: ExecCommandStatus::Failed,
+    });
+    let call_output = ResponseItem::FunctionCallOutput {
+        call_id: original_call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text(output),
+    };
+    (begin, end, call_output)
 }
 
 fn supervisor_tool_display_prefix(tool_name: &str) -> Vec<String> {
@@ -2975,7 +2882,10 @@ mod tests {
             r#"{"path":"src/main.rs","offset":5,"limit":10}"#,
         )
         .expect("should normalize");
-        assert_eq!(normalized, "src/main.rs|5|10");
+        let parsed: serde_json::Value = serde_json::from_str(&normalized).expect("valid JSON");
+        assert_eq!(parsed["path"], "src/main.rs");
+        assert_eq!(parsed["offset"], 5);
+        assert_eq!(parsed["limit"], 10);
     }
 
     #[test]
