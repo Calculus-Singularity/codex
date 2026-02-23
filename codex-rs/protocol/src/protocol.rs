@@ -196,12 +196,12 @@ pub enum Op {
         personality: Option<Personality>,
     },
 
-    /// Send a direct chat message to Gugugaga supervisor.
+    /// Send a direct chat message to GugaCodex supervisor.
     ///
     /// This bypasses the normal Codex turn pipeline and asks the supervisor
     /// agent to respond directly to the user.
     SupervisorChat {
-        /// User message directed to Gugugaga (typically from `// ...` input).
+        /// User message directed to GugaCodex (typically from `// ...` input).
         message: String,
     },
 

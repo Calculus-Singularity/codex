@@ -596,8 +596,8 @@ pub(crate) struct ChatWidget {
     suppress_session_configured_redraw: bool,
     // User messages queued while a turn is in progress
     queued_user_messages: VecDeque<UserMessage>,
-    // Number of outstanding `// chat` requests waiting for a Gugugaga reply.
-    pending_gugugaga_chat_replies: usize,
+    // Number of outstanding `// chat` requests waiting for a GugaCodex reply.
+    pending_guga_chat_replies: usize,
     // Set when supervisor starts post-turn review; consumed by the next ack message.
     pending_supervisor_turn_ack: bool,
     /// Terminal-appropriate keybinding for popping the most-recently queued
@@ -732,7 +732,7 @@ impl From<&str> for UserMessage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GugugagaCommand {
+enum GugaCodexCommand {
     Help,
     Clear,
     Stats,
@@ -740,55 +740,55 @@ enum GugugagaCommand {
     Notebook,
 }
 
-impl GugugagaCommand {
-    fn all() -> &'static [GugugagaCommand] {
+impl GugaCodexCommand {
+    fn all() -> &'static [GugaCodexCommand] {
         &[
-            GugugagaCommand::Help,
-            GugugagaCommand::Clear,
-            GugugagaCommand::Stats,
-            GugugagaCommand::Model,
-            GugugagaCommand::Notebook,
+            GugaCodexCommand::Help,
+            GugaCodexCommand::Clear,
+            GugaCodexCommand::Stats,
+            GugaCodexCommand::Model,
+            GugaCodexCommand::Notebook,
         ]
     }
 
     fn name(self) -> &'static str {
         match self {
-            GugugagaCommand::Help => "help",
-            GugugagaCommand::Clear => "clear",
-            GugugagaCommand::Stats => "stats",
-            GugugagaCommand::Model => "model",
-            GugugagaCommand::Notebook => "notebook",
+            GugaCodexCommand::Help => "help",
+            GugaCodexCommand::Clear => "clear",
+            GugaCodexCommand::Stats => "stats",
+            GugaCodexCommand::Model => "model",
+            GugaCodexCommand::Notebook => "notebook",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
-            GugugagaCommand::Help => "Show Gugugaga help",
-            GugugagaCommand::Clear => "Start a fresh Gugugaga session",
-            GugugagaCommand::Stats => "Show supervision status",
-            GugugagaCommand::Model => "Open or set Gugugaga model",
-            GugugagaCommand::Notebook => "Show Gugugaga notebook",
+            GugaCodexCommand::Help => "Show GugaCodex help",
+            GugaCodexCommand::Clear => "Start a fresh GugaCodex session",
+            GugaCodexCommand::Stats => "Show supervision status",
+            GugaCodexCommand::Model => "Open or set GugaCodex model",
+            GugaCodexCommand::Notebook => "Show GugaCodex notebook",
         }
     }
 
-    fn parse(name: &str) -> Option<GugugagaCommand> {
+    fn parse(name: &str) -> Option<GugaCodexCommand> {
         let name = name.to_ascii_lowercase();
         Self::all().iter().copied().find(|cmd| cmd.name() == name)
     }
 }
 
 #[derive(Debug)]
-enum ParsedGugugagaInput {
-    Command(GugugagaCommand, String),
+enum ParsedGugaCodexInput {
+    Command(GugaCodexCommand, String),
     Chat(String),
 }
 
-fn parse_gugugaga_input(input: &str) -> Option<ParsedGugugagaInput> {
+fn parse_guga_input(input: &str) -> Option<ParsedGugaCodexInput> {
     let trimmed = input.trim();
     let rest = trimmed.strip_prefix("//")?;
     if rest.trim().is_empty() {
-        return Some(ParsedGugugagaInput::Command(
-            GugugagaCommand::Help,
+        return Some(ParsedGugaCodexInput::Command(
+            GugaCodexCommand::Help,
             String::new(),
         ));
     }
@@ -796,11 +796,11 @@ fn parse_gugugaga_input(input: &str) -> Option<ParsedGugugagaInput> {
     let cmd_name = parts.first().copied().unwrap_or_default().trim();
     let args = parts.get(1).copied().unwrap_or_default().to_string();
 
-    if let Some(cmd) = GugugagaCommand::parse(cmd_name) {
-        return Some(ParsedGugugagaInput::Command(cmd, args));
+    if let Some(cmd) = GugaCodexCommand::parse(cmd_name) {
+        return Some(ParsedGugaCodexInput::Command(cmd, args));
     }
 
-    Some(ParsedGugugagaInput::Chat(rest.trim().to_string()))
+    Some(ParsedGugaCodexInput::Chat(rest.trim().to_string()))
 }
 
 pub(crate) fn create_initial_user_message(
@@ -1287,7 +1287,7 @@ impl ChatWidget {
     }
 
     fn on_agent_message(&mut self, message: String, phase: Option<MessagePhase>) {
-        if self.try_render_gugugaga_agent_message(message.as_str(), phase.as_ref()) {
+        if self.try_render_guga_agent_message(message.as_str(), phase.as_ref()) {
             return;
         }
         // If we have a stream_controller, then the final agent message is redundant and will be a
@@ -1743,9 +1743,8 @@ impl ChatWidget {
 
     fn on_warning(&mut self, message: impl Into<String>) {
         let message = message.into();
-        if self.pending_gugugaga_chat_replies > 0 && message.starts_with("Gugugaga chat failed:") {
-            self.pending_gugugaga_chat_replies =
-                self.pending_gugugaga_chat_replies.saturating_sub(1);
+        if self.pending_guga_chat_replies > 0 && message.starts_with("GugaCodex chat failed:") {
+            self.pending_guga_chat_replies = self.pending_guga_chat_replies.saturating_sub(1);
         }
         self.add_to_history(history_cell::new_warning_event(message));
         self.request_redraw();
@@ -2271,7 +2270,7 @@ impl ChatWidget {
         self.set_status_header(message);
     }
 
-    fn try_render_gugugaga_agent_message(
+    fn try_render_guga_agent_message(
         &mut self,
         message: &str,
         phase: Option<&MessagePhase>,
@@ -2283,19 +2282,17 @@ impl ChatWidget {
 
         let from_phase = matches!(phase, Some(MessagePhase::Commentary))
             && (!self.agent_turn_running
-                || self.pending_gugugaga_chat_replies > 0
+                || self.pending_guga_chat_replies > 0
                 || self.pending_supervisor_turn_ack);
-        let from_chat = self.pending_gugugaga_chat_replies > 0 && !self.agent_turn_running;
+        let from_chat = self.pending_guga_chat_replies > 0 && !self.agent_turn_running;
         let from_turn_ack = self.pending_supervisor_turn_ack;
         if !from_phase && !from_chat && !from_turn_ack {
             return false;
         }
 
-        let consume_chat_pending =
-            from_chat || (from_phase && self.pending_gugugaga_chat_replies > 0);
+        let consume_chat_pending = from_chat || (from_phase && self.pending_guga_chat_replies > 0);
         if consume_chat_pending {
-            self.pending_gugugaga_chat_replies =
-                self.pending_gugugaga_chat_replies.saturating_sub(1);
+            self.pending_guga_chat_replies = self.pending_guga_chat_replies.saturating_sub(1);
         }
         if from_turn_ack {
             self.pending_supervisor_turn_ack = false;
@@ -2303,7 +2300,7 @@ impl ChatWidget {
 
         self.flush_answer_stream_with_separator();
         self.handle_stream_finished();
-        self.add_to_history(history_cell::new_gugugaga_message(trimmed.to_string()));
+        self.add_to_history(history_cell::new_guga_message(trimmed.to_string()));
         self.request_redraw();
         true
     }
@@ -2837,7 +2834,7 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
-            pending_gugugaga_chat_replies: 0,
+            pending_guga_chat_replies: 0,
             pending_supervisor_turn_ack: false,
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
@@ -3013,7 +3010,7 @@ impl ChatWidget {
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
-            pending_gugugaga_chat_replies: 0,
+            pending_guga_chat_replies: 0,
             pending_supervisor_turn_ack: false,
             queued_message_edit_binding,
             show_welcome_banner: is_first_run,
@@ -3170,7 +3167,7 @@ impl ChatWidget {
             thread_name: None,
             forked_from: None,
             queued_user_messages: VecDeque::new(),
-            pending_gugugaga_chat_replies: 0,
+            pending_guga_chat_replies: 0,
             pending_supervisor_turn_ack: false,
             queued_message_edit_binding,
             show_welcome_banner: false,
@@ -3316,7 +3313,7 @@ impl ChatWidget {
                     text,
                     text_elements,
                 } => {
-                    if self.try_handle_gugugaga_submission(&text) {
+                    if self.try_handle_guga_submission(&text) {
                         // Drain staged submission artifacts so they do not leak
                         // into the next real user turn.
                         self.bottom_pane
@@ -3353,7 +3350,7 @@ impl ChatWidget {
                     text,
                     text_elements,
                 } => {
-                    if self.try_handle_gugugaga_submission(&text) {
+                    if self.try_handle_guga_submission(&text) {
                         self.bottom_pane
                             .take_recent_submission_images_with_placeholders();
                         self.take_remote_image_urls();
@@ -3433,23 +3430,23 @@ impl ChatWidget {
         self.bottom_pane.can_launch_external_editor()
     }
 
-    fn try_handle_gugugaga_submission(&mut self, text: &str) -> bool {
-        let Some(parsed) = parse_gugugaga_input(text) else {
+    fn try_handle_guga_submission(&mut self, text: &str) -> bool {
+        let Some(parsed) = parse_guga_input(text) else {
             return false;
         };
 
         match parsed {
-            ParsedGugugagaInput::Command(cmd, args) => self.dispatch_gugugaga_command(cmd, args),
-            ParsedGugugagaInput::Chat(message) => self.submit_gugugaga_chat_message(message),
+            ParsedGugaCodexInput::Command(cmd, args) => self.dispatch_guga_command(cmd, args),
+            ParsedGugaCodexInput::Chat(message) => self.submit_guga_chat_message(message),
         }
         self.request_redraw();
         true
     }
 
-    fn submit_gugugaga_chat_message(&mut self, message: String) {
+    fn submit_guga_chat_message(&mut self, message: String) {
         let message = message.trim();
         if message.is_empty() {
-            self.add_error_message("Gugugaga chat message cannot be empty.".to_string());
+            self.add_error_message("GugaCodex chat message cannot be empty.".to_string());
             return;
         }
         if !self.is_session_configured() {
@@ -3457,22 +3454,20 @@ impl ChatWidget {
             return;
         }
 
-        self.add_to_history(history_cell::new_user_to_gugugaga_prompt(
-            message.to_string(),
-        ));
-        self.pending_gugugaga_chat_replies = self.pending_gugugaga_chat_replies.saturating_add(1);
+        self.add_to_history(history_cell::new_user_to_guga_prompt(message.to_string()));
+        self.pending_guga_chat_replies = self.pending_guga_chat_replies.saturating_add(1);
         self.submit_op(Op::SupervisorChat {
             message: message.to_string(),
         });
     }
 
-    fn dispatch_gugugaga_command(&mut self, cmd: GugugagaCommand, args: String) {
+    fn dispatch_guga_command(&mut self, cmd: GugaCodexCommand, args: String) {
         let trimmed_args = args.trim().to_string();
-        self.add_gugugaga_command_echo(cmd, &trimmed_args);
+        self.add_guga_command_echo(cmd, &trimmed_args);
         match cmd {
-            GugugagaCommand::Help => {
-                let mut lines = vec!["Gugugaga commands (//):".to_string(), "".to_string()];
-                for command in GugugagaCommand::all().iter().copied() {
+            GugaCodexCommand::Help => {
+                let mut lines = vec!["GugaCodex commands (//):".to_string(), "".to_string()];
+                for command in GugaCodexCommand::all().iter().copied() {
                     lines.push(format!(
                         "  //{:<10} - {}",
                         command.name(),
@@ -3483,7 +3478,7 @@ impl ChatWidget {
                 lines.push("Codex commands (/): use the existing /... command set.".to_string());
                 self.add_info_message(lines.join("\n"), None);
             }
-            GugugagaCommand::Clear => {
+            GugaCodexCommand::Clear => {
                 if self.bottom_pane.is_task_running() {
                     self.add_error_message(
                         "'//clear' is disabled while a task is in progress.".to_string(),
@@ -3492,7 +3487,7 @@ impl ChatWidget {
                     self.app_event_tx.send(AppEvent::NewSession);
                 }
             }
-            GugugagaCommand::Stats => {
+            GugaCodexCommand::Stats => {
                 let thread_label = self
                     .thread_id
                     .as_ref()
@@ -3504,14 +3499,14 @@ impl ChatWidget {
                     .map(|thread_id| {
                         self.config
                             .codex_home
-                            .join("gugugaga")
+                            .join("guga-codex")
                             .join("notebooks")
                             .join(format!("{thread_id}.json"))
                     })
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "(thread id not available yet)".to_string());
                 let status = [
-                    "Gugugaga status".to_string(),
+                    "GugaCodex status".to_string(),
                     format!("  thread: {thread_label}"),
                     format!("  running: {}", self.bottom_pane.is_task_running()),
                     format!("  queued messages: {}", self.queued_user_messages.len()),
@@ -3520,7 +3515,7 @@ impl ChatWidget {
                 .join("\n");
                 self.add_info_message(status, None);
             }
-            GugugagaCommand::Model => {
+            GugaCodexCommand::Model => {
                 if trimmed_args.is_empty() {
                     self.open_model_popup();
                     return;
@@ -3567,7 +3562,10 @@ impl ChatWidget {
                         selected_model.clone(),
                         Some(preset.default_reasoning_effort),
                     );
-                    self.add_info_message(format!("Gugugaga model set to {selected_model}."), None);
+                    self.add_info_message(
+                        format!("GugaCodex model set to {selected_model}."),
+                        None,
+                    );
                     return;
                 }
 
@@ -3579,15 +3577,15 @@ impl ChatWidget {
                     .collect();
 
                 if suggestions.is_empty() {
-                    self.add_error_message(format!("Unknown Gugugaga model: {requested_model}."));
+                    self.add_error_message(format!("Unknown GugaCodex model: {requested_model}."));
                 } else {
                     self.add_error_message(format!(
-                        "Unknown Gugugaga model: {requested_model}. Candidates: {}",
+                        "Unknown GugaCodex model: {requested_model}. Candidates: {}",
                         suggestions.join(", ")
                     ));
                 }
             }
-            GugugagaCommand::Notebook => {
+            GugaCodexCommand::Notebook => {
                 let Some(thread_id) = self.thread_id else {
                     self.add_info_message(
                         "Notebook is unavailable until the session thread is ready.".to_string(),
@@ -3598,7 +3596,7 @@ impl ChatWidget {
                 let notebook_path = self
                     .config
                     .codex_home
-                    .join("gugugaga")
+                    .join("guga-codex")
                     .join("notebooks")
                     .join(format!("{thread_id}.json"));
                 match std::fs::read_to_string(&notebook_path) {
@@ -3615,7 +3613,7 @@ impl ChatWidget {
         }
     }
 
-    fn add_gugugaga_command_echo(&mut self, cmd: GugugagaCommand, args: &str) {
+    fn add_guga_command_echo(&mut self, cmd: GugaCodexCommand, args: &str) {
         let line = if args.is_empty() {
             format!("//{}", cmd.name())
         } else {

@@ -49,14 +49,14 @@ use crate::supervisor::notebook::SupervisorNotebook;
 use crate::tools::spec::AdditionalProperties;
 use crate::tools::spec::JsonSchema;
 
-const SUPERVISOR_ENV_VAR: &str = "GUGUGAGA_SUPERVISOR_ENABLED";
+const SUPERVISOR_ENV_VAR: &str = "GUGA_CODEX_SUPERVISOR_ENABLED";
 const MAX_SUPERVISOR_FOLLOW_UP_ROUNDS: u32 = 8;
 const MAX_SUPERVISOR_TOOL_CALLS: usize = 24;
 const MAX_GLOB_VISITS: usize = 20_000;
 const TOOL_OUTPUT_LIMIT: usize = 4_000;
 const SUPERVISOR_STREAM_TIMEOUT: Duration = Duration::from_secs(45);
-const SUPERVISOR_BASE_INSTRUCTIONS: &str = "You are Gugugaga, the supervision agent for Codex. Prefer conservative decisions and JSON-only outputs.";
-const SUPERVISOR_CHAT_BASE_INSTRUCTIONS: &str = "You are Gugugaga, the supervision agent for Codex. Reply to the user in natural language and do not wrap your reply in JSON.";
+const SUPERVISOR_BASE_INSTRUCTIONS: &str = "You are GugaCodex, the supervision agent for Codex. Prefer conservative decisions and JSON-only outputs.";
+const SUPERVISOR_CHAT_BASE_INSTRUCTIONS: &str = "You are GugaCodex, the supervision agent for Codex. Reply to the user in natural language and do not wrap your reply in JSON.";
 const NOTEBOOK_VALIDATION_EXAMPLE: &str = r#"Example (minimal business-field format):
 {
   "current_activity": "Reviewing current task",
@@ -127,7 +127,7 @@ impl SupervisorDecision {
         let correction = self.correction.as_deref().unwrap_or("(none)").trim();
 
         Some(format!(
-            "gugugaga supervisor violation {violation_type}: {description}. correction: {correction}"
+            "guga-codex supervisor violation {violation_type}: {description}. correction: {correction}"
         ))
     }
 
@@ -257,11 +257,11 @@ impl SupervisorRuntime {
         }
 
         let notebook_path = codex_home
-            .join("gugugaga")
+            .join("guga-codex")
             .join("notebooks")
             .join(format!("{conversation_id}.json"));
         let history_archive_path = codex_home
-            .join("gugugaga")
+            .join("guga-codex")
             .join("history")
             .join(format!("{conversation_id}.jsonl"));
         let notebook = load_notebook(&notebook_path).await.unwrap_or_default();
@@ -361,9 +361,9 @@ impl SupervisorRuntime {
         if !notebook_changed_by_tools {
             let mut notebook = self.notebook.lock().await;
             notebook.apply_after_agent_update(
-                format!("Reviewed gugugaga turn {turn_id}"),
+                format!("Reviewed guga-codex turn {turn_id}"),
                 review_summary,
-                "Awaiting next gugugaga review".to_string(),
+                "Awaiting next guga-codex review".to_string(),
             );
             let snapshot = notebook.clone();
             drop(notebook);
@@ -636,9 +636,9 @@ impl SupervisorRuntime {
             )
             .await;
         };
-        self.append_history_turn("user_to_gugugaga", user_message)
+        self.append_history_turn("user_to_guga_codex", user_message)
             .await;
-        self.append_history_turn("gugugaga", reply.as_str()).await;
+        self.append_history_turn("guga-codex", reply.as_str()).await;
         Ok(SupervisorChatOutcome {
             reply,
             events: ui_events,
@@ -812,7 +812,7 @@ impl SupervisorRuntime {
             turn_items.push(tool_call.item.clone());
             let signature = format!("{}::{}", tool_call.tool_name, tool_call.arguments);
             let mut command = supervisor_tool_display_prefix(tool_call.tool_name.as_str());
-            let tool_call_id = format!("gugugaga-supervisor-{round}-{}", tool_call.call_id);
+            let tool_call_id = format!("guga-codex-supervisor-{round}-{}", tool_call.call_id);
             let turn_id = turn_context.sub_id.clone();
             let cwd = turn_context.cwd.clone();
 
@@ -1070,7 +1070,7 @@ impl SupervisorRuntime {
         let notebook_path = self
             .notebook_path
             .clone()
-            .unwrap_or_else(|| PathBuf::from("gugugaga/notebook.json"));
+            .unwrap_or_else(|| PathBuf::from("guga-codex/notebook.json"));
         let notebook_path_display = notebook_path.to_string_lossy().replace('\\', "/");
         let mut changes = HashMap::new();
         changes.insert(
@@ -2271,7 +2271,7 @@ fn build_supervisor_prompt(
         .unwrap_or("(no user message captured)");
 
     format!(
-        r#"You are Gugugaga, the supervision agent for Codex. You have your own notebook and long-term memory.
+        r#"You are GugaCodex, the supervision agent for Codex. You have your own notebook and long-term memory.
 
 === Your Notebook File (Persistent) ===
 {notebook_text}
@@ -2364,7 +2364,7 @@ fn build_supervisor_chat_prompt(
     history_excerpt: &str,
 ) -> String {
     format!(
-        r#"You are Gugugaga, an AI supervision agent that monitors another AI (Codex).
+        r#"You are GugaCodex, an AI supervision agent that monitors another AI (Codex).
 You have full access to the conversation history and your personal notebook.
 
 === Your Notebook File (Persistent) ===
@@ -2706,18 +2706,18 @@ fn tool_args_preview(args: &str) -> String {
 
 fn supervisor_tool_display_prefix(tool_name: &str) -> Vec<String> {
     match tool_name {
-        "read_notebook" => vec!["gugugaga/notebook".to_string(), "read".to_string()],
-        "apply_patch_notebook" => vec!["gugugaga/notebook".to_string(), "patch".to_string()],
-        "search_history" => vec!["gugugaga/history".to_string(), "search".to_string()],
-        "read_recent" => vec!["gugugaga/history".to_string(), "read_recent".to_string()],
-        "read_turn" => vec!["gugugaga/history".to_string(), "read_turn".to_string()],
-        "history_stats" => vec!["gugugaga/history".to_string(), "stats".to_string()],
-        "read_file" => vec!["gugugaga/fs".to_string(), "read".to_string()],
-        "glob" => vec!["gugugaga/fs".to_string(), "glob".to_string()],
-        "ls" => vec!["gugugaga/fs".to_string(), "list".to_string()],
-        "rg" => vec!["gugugaga/fs".to_string(), "search".to_string()],
-        "shell" => vec!["gugugaga/fs".to_string(), "shell".to_string()],
-        _ => vec!["gugugaga/tool".to_string(), tool_name.to_string()],
+        "read_notebook" => vec!["guga-codex/notebook".to_string(), "read".to_string()],
+        "apply_patch_notebook" => vec!["guga-codex/notebook".to_string(), "patch".to_string()],
+        "search_history" => vec!["guga-codex/history".to_string(), "search".to_string()],
+        "read_recent" => vec!["guga-codex/history".to_string(), "read_recent".to_string()],
+        "read_turn" => vec!["guga-codex/history".to_string(), "read_turn".to_string()],
+        "history_stats" => vec!["guga-codex/history".to_string(), "stats".to_string()],
+        "read_file" => vec!["guga-codex/fs".to_string(), "read".to_string()],
+        "glob" => vec!["guga-codex/fs".to_string(), "glob".to_string()],
+        "ls" => vec!["guga-codex/fs".to_string(), "list".to_string()],
+        "rg" => vec!["guga-codex/fs".to_string(), "search".to_string()],
+        "shell" => vec!["guga-codex/fs".to_string(), "shell".to_string()],
+        _ => vec!["guga-codex/tool".to_string(), tool_name.to_string()],
     }
 }
 
@@ -2743,7 +2743,7 @@ fn supervisor_tool_parsed_command(
         "read_notebook" => {
             let path = notebook_path
                 .cloned()
-                .unwrap_or_else(|| PathBuf::from("gugugaga/notebook.json"));
+                .unwrap_or_else(|| PathBuf::from("guga-codex/notebook.json"));
             vec![ParsedCommand::Read {
                 cmd: "read_notebook".to_string(),
                 name: "notebook".to_string(),
@@ -2850,7 +2850,7 @@ mod tests {
 
         let notebook_path = dir
             .path()
-            .join("gugugaga")
+            .join("guga-codex")
             .join("notebooks")
             .join(format!("{conversation_id}.json"));
         assert!(notebook_path.exists());
@@ -2858,7 +2858,7 @@ mod tests {
         let stored = tokio::fs::read_to_string(notebook_path)
             .await
             .expect("read notebook");
-        assert!(stored.contains("Reviewed gugugaga turn turn-1"));
+        assert!(stored.contains("Reviewed guga-codex turn turn-1"));
     }
 
     #[tokio::test]
@@ -2913,11 +2913,11 @@ mod tests {
     #[test]
     fn normalize_supervisor_chat_reply_unwraps_reply_json() {
         let normalized = normalize_supervisor_chat_reply(
-            r#"{"reply":"你好，我是 Gugugaga（监督代理）。目前状态正常。"}"#,
+            r#"{"reply":"你好，我是 GugaCodex（监督代理）。目前状态正常。"}"#,
         );
         assert_eq!(
             normalized,
-            "你好，我是 Gugugaga（监督代理）。目前状态正常。"
+            "你好，我是 GugaCodex（监督代理）。目前状态正常。"
         );
     }
 
@@ -2989,7 +2989,7 @@ mod tests {
     fn supervisor_tool_display_prefix_uses_notebook_friendly_name() {
         assert_eq!(
             supervisor_tool_display_prefix("apply_patch_notebook"),
-            vec!["gugugaga/notebook".to_string(), "patch".to_string()]
+            vec!["guga-codex/notebook".to_string(), "patch".to_string()]
         );
     }
 
@@ -3002,7 +3002,7 @@ mod tests {
             Path::new("/tmp"),
             Some(&path),
             true,
-            &["gugugaga/notebook".to_string(), "read".to_string()],
+            &["guga-codex/notebook".to_string(), "read".to_string()],
         );
         assert_eq!(
             parsed,

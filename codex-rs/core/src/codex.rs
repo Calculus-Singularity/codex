@@ -3668,7 +3668,7 @@ mod handlers {
             sess.send_event_raw(Event {
                 id: sub_id,
                 msg: EventMsg::Warning(WarningEvent {
-                    message: "Gugugaga chat message is empty.".to_string(),
+                    message: "GugaCodex chat message is empty.".to_string(),
                 }),
             })
             .await;
@@ -3680,7 +3680,7 @@ mod handlers {
                 id: sub_id,
                 msg: EventMsg::Warning(WarningEvent {
                     message:
-                        "Gugugaga supervisor is disabled. Set GUGUGAGA_SUPERVISOR_ENABLED=1 to enable it."
+                        "GugaCodex supervisor is disabled. Set GUGA_CODEX_SUPERVISOR_ENABLED=1 to enable it."
                             .to_string(),
                 }),
             })
@@ -3732,7 +3732,7 @@ mod handlers {
                 sess.send_event(
                     turn_context.as_ref(),
                     EventMsg::Warning(WarningEvent {
-                        message: format!("Gugugaga chat failed: {err}"),
+                        message: format!("GugaCodex chat failed: {err}"),
                     }),
                 )
                 .await;
@@ -4978,7 +4978,7 @@ pub(crate) async fn run_turn(
                                             sess.send_event(
                                                 &turn_context,
                                                 EventMsg::Warning(WarningEvent {
-                                                    message: "gugugaga supervisor correction was generated but could not be queued".to_string(),
+                                                    message: "guga-codex supervisor correction was generated but could not be queued".to_string(),
                                                 }),
                                             )
                                             .await;

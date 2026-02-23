@@ -94,9 +94,9 @@ pub fn resume_command(thread_name: Option<&str>, thread_id: Option<ThreadId>) ->
         let needs_double_dash = target.starts_with('-');
         let escaped = shlex_join(&[target]);
         if needs_double_dash {
-            format!("gugugaga resume -- {escaped}")
+            format!("guga-codex resume -- {escaped}")
         } else {
-            format!("gugugaga resume {escaped}")
+            format!("guga-codex resume {escaped}")
         }
     })
 }
@@ -150,7 +150,7 @@ mod tests {
     fn resume_command_prefers_name_over_id() {
         let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
         let command = resume_command(Some("my-thread"), Some(thread_id));
-        assert_eq!(command, Some("gugugaga resume my-thread".to_string()));
+        assert_eq!(command, Some("guga-codex resume my-thread".to_string()));
     }
 
     #[test]
@@ -159,7 +159,7 @@ mod tests {
         let command = resume_command(None, Some(thread_id));
         assert_eq!(
             command,
-            Some("gugugaga resume 123e4567-e89b-12d3-a456-426614174000".to_string())
+            Some("guga-codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
         );
     }
 
@@ -174,13 +174,16 @@ mod tests {
         let command = resume_command(Some("-starts-with-dash"), None);
         assert_eq!(
             command,
-            Some("gugugaga resume -- -starts-with-dash".to_string())
+            Some("guga-codex resume -- -starts-with-dash".to_string())
         );
 
         let command = resume_command(Some("two words"), None);
-        assert_eq!(command, Some("gugugaga resume 'two words'".to_string()));
+        assert_eq!(command, Some("guga-codex resume 'two words'".to_string()));
 
         let command = resume_command(Some("quote'case"), None);
-        assert_eq!(command, Some("gugugaga resume \"quote'case\"".to_string()));
+        assert_eq!(
+            command,
+            Some("guga-codex resume \"quote'case\"".to_string())
+        );
     }
 }

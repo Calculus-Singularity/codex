@@ -121,9 +121,9 @@ async fn test_config() -> Config {
 }
 
 #[test]
-fn parses_gugugaga_command_input() {
-    match parse_gugugaga_input("//help") {
-        Some(ParsedGugugagaInput::Command(GugugagaCommand::Help, args)) => {
+fn parses_guga_command_input() {
+    match parse_guga_input("//help") {
+        Some(ParsedGugaCodexInput::Command(GugaCodexCommand::Help, args)) => {
             assert!(args.is_empty());
         }
         other => panic!("unexpected parse result: {other:?}"),
@@ -131,9 +131,9 @@ fn parses_gugugaga_command_input() {
 }
 
 #[test]
-fn parses_gugugaga_chat_input() {
-    match parse_gugugaga_input("// why did you stop this turn") {
-        Some(ParsedGugugagaInput::Chat(text)) => {
+fn parses_guga_chat_input() {
+    match parse_guga_input("// why did you stop this turn") {
+        Some(ParsedGugaCodexInput::Chat(text)) => {
             assert_eq!(text, "why did you stop this turn");
         }
         other => panic!("unexpected parse result: {other:?}"),
@@ -141,9 +141,9 @@ fn parses_gugugaga_chat_input() {
 }
 
 #[test]
-fn parses_empty_gugugaga_input_as_help_command() {
-    match parse_gugugaga_input("//") {
-        Some(ParsedGugugagaInput::Command(GugugagaCommand::Help, args)) => {
+fn parses_empty_guga_input_as_help_command() {
+    match parse_guga_input("//") {
+        Some(ParsedGugaCodexInput::Command(GugaCodexCommand::Help, args)) => {
             assert!(args.is_empty());
         }
         other => panic!("unexpected parse result: {other:?}"),
@@ -268,7 +268,7 @@ async fn resumed_initial_messages_render_history() {
 }
 
 #[tokio::test]
-async fn resumed_gugugaga_agent_message_keeps_magenta_prefix() {
+async fn resumed_guga_agent_message_keeps_magenta_prefix() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
 
     let conversation_id = ThreadId::new();
@@ -308,14 +308,14 @@ async fn resumed_gugugaga_agent_message_keeps_magenta_prefix() {
 
     assert!(
         text_blob.contains("▎ supervisor replay reply"),
-        "expected resumed Gugugaga message to keep magenta prefixed style; got: {text_blob:?}",
+        "expected resumed GugaCodex message to keep magenta prefixed style; got: {text_blob:?}",
     );
 }
 
 #[tokio::test]
-async fn live_gugugaga_commentary_renders_magenta_while_turn_running() {
+async fn live_guga_commentary_renders_magenta_while_turn_running() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
-    chat.pending_gugugaga_chat_replies = 1;
+    chat.pending_guga_chat_replies = 1;
     chat.on_task_started();
 
     chat.handle_codex_event(Event {
@@ -336,9 +336,9 @@ async fn live_gugugaga_commentary_renders_magenta_while_turn_running() {
 
     assert!(
         text_blob.contains("▎ live supervisor reply"),
-        "expected live Gugugaga commentary to keep magenta style while running; got: {text_blob:?}",
+        "expected live GugaCodex commentary to keep magenta style while running; got: {text_blob:?}",
     );
-    assert_eq!(chat.pending_gugugaga_chat_replies, 0);
+    assert_eq!(chat.pending_guga_chat_replies, 0);
 }
 
 #[tokio::test]
@@ -1762,7 +1762,7 @@ async fn make_chatwidget_manual(
         task_complete_pending: false,
         unified_exec_processes: Vec::new(),
         agent_turn_running: false,
-        pending_gugugaga_chat_replies: 0,
+        pending_guga_chat_replies: 0,
         pending_supervisor_turn_ack: false,
         mcp_startup_status: None,
         connectors_cache: ConnectorsCacheState::default(),
@@ -6966,7 +6966,7 @@ async fn apply_patch_events_emit_history_cells() {
 async fn apply_patch_begin_uses_notebook_semantic_cell_when_possible() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     let temp = tempdir().expect("tempdir");
-    let notebook_dir = temp.path().join("gugugaga/notebooks");
+    let notebook_dir = temp.path().join("guga-codex/notebooks");
     fs::create_dir_all(&notebook_dir).expect("create notebook dir");
     let notebook_path = notebook_dir.join("thread-1.json");
 

@@ -1050,10 +1050,10 @@ fn is_notebook_path(path: &Path) -> bool {
         .replace('\\', "/")
         .to_ascii_lowercase();
     normalized.ends_with(".json")
-        && (normalized.contains("/gugugaga/notebooks/")
-            || normalized.starts_with("gugugaga/notebooks/")
-            || normalized.ends_with("/gugugaga/notebook.json")
-            || normalized == "gugugaga/notebook.json")
+        && (normalized.contains("/guga-codex/notebooks/")
+            || normalized.starts_with("guga-codex/notebooks/")
+            || normalized.ends_with("/guga-codex/notebook.json")
+            || normalized == "guga-codex/notebook.json")
 }
 
 fn parse_notebook_unified_diff(diff: &str) -> Option<NotebookUnifiedDiff> {
@@ -1153,7 +1153,7 @@ fn build_notebook_semantic_diff(
     };
 
     NotebookSemanticDiff {
-        display_path: "gugugaga/notebooks".to_string(),
+        display_path: "guga-codex/notebooks".to_string(),
         activity_change,
         completed: build_list_diff(before, after, "completed", "what", format_completed_item),
         attention: build_list_diff(before, after, "attention", "content", format_attention_item),
@@ -1511,7 +1511,7 @@ pub(crate) fn new_user_prompt(
     }
 }
 
-pub(crate) fn new_user_to_gugugaga_prompt(message: String) -> PrefixedWrappedHistoryCell {
+pub(crate) fn new_user_to_guga_prompt(message: String) -> PrefixedWrappedHistoryCell {
     PrefixedWrappedHistoryCell::new(
         Text::from(message),
         Line::from(vec!["▎".magenta(), "› ".magenta().bold()]),
@@ -1519,7 +1519,7 @@ pub(crate) fn new_user_to_gugugaga_prompt(message: String) -> PrefixedWrappedHis
     )
 }
 
-pub(crate) fn new_gugugaga_message(message: String) -> PrefixedWrappedHistoryCell {
+pub(crate) fn new_guga_message(message: String) -> PrefixedWrappedHistoryCell {
     let mut lines: Vec<Line<'static>> = Vec::new();
     append_markdown(&message, None, &mut lines);
     let text = if lines.is_empty() {
@@ -2960,8 +2960,8 @@ mod tests {
     }
 
     #[test]
-    fn gugugaga_message_renders_markdown_content() {
-        let cell = new_gugugaga_message(
+    fn guga_codex_codex_message_renders_markdown_content() {
+        let cell = new_guga_message(
             "**Bold** supervisor reply with `code` and [link](https://example.com)".to_string(),
         );
         let rendered = render_lines(&cell.display_lines(200)).join("\n");
@@ -2974,7 +2974,7 @@ mod tests {
     #[test]
     fn notebook_patch_event_renders_semantic_field_diff() {
         let temp = tempdir().expect("tempdir");
-        let notebook_path = temp.path().join("gugugaga/notebooks/thread-1.json");
+        let notebook_path = temp.path().join("guga-codex/notebooks/thread-1.json");
         fs::create_dir_all(
             notebook_path
                 .parent()

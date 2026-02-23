@@ -138,7 +138,7 @@ use super::command_popup::CommandItem;
 use super::command_popup::CommandPopup;
 use super::command_popup::CommandPopupFlags;
 use super::command_popup::CommandPopupMode;
-use super::command_popup::has_gugugaga_prefix;
+use super::command_popup::has_guga_prefix;
 use super::file_search_popup::FileSearchPopup;
 use super::footer::CollaborationModeIndicator;
 use super::footer::FooterMode;
@@ -1243,7 +1243,7 @@ impl ChatComposer {
                                 }
                             }
                         }
-                        CommandItem::Gugugaga(command_name) => {
+                        CommandItem::GugaCodex(command_name) => {
                             let starts_with_cmd = first_line
                                 .trim_start()
                                 .starts_with(&format!("//{command_name}"));
@@ -1267,8 +1267,8 @@ impl ChatComposer {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                if popup_mode == CommandPopupMode::Gugugaga {
-                    if let Some(CommandItem::Gugugaga(command_name)) = popup.selected_item() {
+                if popup_mode == CommandPopupMode::GugaCodex {
+                    if let Some(CommandItem::GugaCodex(command_name)) = popup.selected_item() {
                         self.textarea.set_text_clearing_elements("");
                         return (
                             InputResult::Submitted {
@@ -1356,7 +1356,7 @@ impl ChatComposer {
                             }
                             return (InputResult::None, true);
                         }
-                        CommandItem::Gugugaga(_) => return (InputResult::None, true),
+                        CommandItem::GugaCodex(_) => return (InputResult::None, true),
                     }
                 }
                 // Fallback to default newline handling if no command selected.
@@ -3107,7 +3107,10 @@ impl ChatComposer {
 
     /// If the cursor is currently within a `//name` command token on the first line,
     /// extract the command name and the rest of the line after it.
-    fn gugugaga_command_under_cursor(first_line: &str, cursor: usize) -> Option<(&str, &str)> {
+    fn guga_codex_codex_command_under_cursor(
+        first_line: &str,
+        cursor: usize,
+    ) -> Option<(&str, &str)> {
         let stripped = first_line.strip_prefix("//")?;
         let name_end_in_stripped = stripped
             .find(char::is_whitespace)
@@ -3153,11 +3156,11 @@ impl ChatComposer {
         })
     }
 
-    fn looks_like_gugugaga_prefix(&self, name: &str, rest_after_name: &str) -> bool {
+    fn looks_like_guga_prefix(&self, name: &str, rest_after_name: &str) -> bool {
         if name.is_empty() {
             return rest_after_name.is_empty();
         }
-        has_gugugaga_prefix(name)
+        has_guga_prefix(name)
     }
 
     /// Synchronize `self.command_popup` with the current text in the
@@ -3179,10 +3182,10 @@ impl ChatComposer {
 
         let editing_mode = if !caret_on_first_line {
             None
-        } else if Self::gugugaga_command_under_cursor(first_line, cursor)
-            .is_some_and(|(name, rest)| self.looks_like_gugugaga_prefix(name, rest))
+        } else if Self::guga_codex_codex_command_under_cursor(first_line, cursor)
+            .is_some_and(|(name, rest)| self.looks_like_guga_prefix(name, rest))
         {
-            Some(CommandPopupMode::Gugugaga)
+            Some(CommandPopupMode::GugaCodex)
         } else if Self::slash_command_under_cursor(first_line, cursor)
             .is_some_and(|(name, rest)| self.looks_like_slash_prefix(name, rest))
         {
@@ -3220,7 +3223,7 @@ impl ChatComposer {
                                     },
                                 )
                             }
-                            CommandPopupMode::Gugugaga => CommandPopup::new_gugugaga(),
+                            CommandPopupMode::GugaCodex => CommandPopup::new_guga_codex(),
                         };
                     }
                     popup.on_composer_text_change(first_line.to_string());
@@ -3246,7 +3249,7 @@ impl ChatComposer {
                                 },
                             )
                         }
-                        CommandPopupMode::Gugugaga => CommandPopup::new_gugugaga(),
+                        CommandPopupMode::GugaCodex => CommandPopup::new_guga_codex(),
                     };
                     command_popup.on_composer_text_change(first_line.to_string());
                     self.active_popup = ActivePopup::Command(command_popup);
@@ -5550,8 +5553,8 @@ mod tests {
                 Some(CommandItem::UserPrompt(_)) => {
                     panic!("unexpected prompt selected for '/mo'")
                 }
-                Some(CommandItem::Gugugaga(_)) => {
-                    panic!("unexpected gugugaga command selected for '/mo'")
+                Some(CommandItem::GugaCodex(_)) => {
+                    panic!("unexpected guga-codex command selected for '/mo'")
                 }
                 None => panic!("no selected command for '/mo'"),
             },
@@ -5610,8 +5613,8 @@ mod tests {
                 Some(CommandItem::UserPrompt(_)) => {
                     panic!("unexpected prompt selected for '/res'")
                 }
-                Some(CommandItem::Gugugaga(_)) => {
-                    panic!("unexpected gugugaga command selected for '/res'")
+                Some(CommandItem::GugaCodex(_)) => {
+                    panic!("unexpected guga-codex command selected for '/res'")
                 }
                 None => panic!("no selected command for '/res'"),
             },
@@ -5635,15 +5638,15 @@ mod tests {
 
         match &composer.active_popup {
             ActivePopup::Command(popup) => {
-                assert_eq!(popup.mode(), CommandPopupMode::Gugugaga);
-                assert_eq!(popup.selected_item(), Some(CommandItem::Gugugaga("help")));
+                assert_eq!(popup.mode(), CommandPopupMode::GugaCodex);
+                assert_eq!(popup.selected_item(), Some(CommandItem::GugaCodex("help")));
             }
-            _ => panic!("gugugaga popup not active after typing '//'"),
+            _ => panic!("guga-codex popup not active after typing '//'"),
         }
     }
 
     #[test]
-    fn double_slash_enter_submits_selected_gugugaga_command() {
+    fn double_slash_enter_submits_selected_guga_command() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
         let mut composer = ChatComposer::new(

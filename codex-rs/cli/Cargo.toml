@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "gugugaga"
+name = "guga-codex"
 path = "src/main.rs"
 
 [lib]

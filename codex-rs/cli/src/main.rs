@@ -59,10 +59,10 @@ use codex_core::terminal::TerminalName;
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform‑specific name like
-    // `gugugaga-x86_64-unknown-linux-musl`, but the help output should always use
-    // the generic `gugugaga` command name that users run.
-    bin_name = "gugugaga",
-    override_usage = "gugugaga [OPTIONS] [PROMPT]\n       gugugaga [OPTIONS] <COMMAND> [ARGS]"
+    // `guga-codex-x86_64-unknown-linux-musl`, but the help output should always use
+    // the generic `guga-codex` command name that users run.
+    bin_name = "guga-codex",
+    override_usage = "guga-codex [OPTIONS] [PROMPT]\n       guga-codex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
     #[clap(flatten)]
@@ -80,7 +80,7 @@ struct MultitoolCli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Subcommand {
-    /// Run gugugaga non-interactively.
+    /// Run guga-codex non-interactively.
     #[clap(visible_alias = "e")]
     Exec(ExecCli),
 
@@ -93,23 +93,23 @@ enum Subcommand {
     /// Remove stored authentication credentials.
     Logout(LogoutCommand),
 
-    /// Manage external MCP servers for gugugaga.
+    /// Manage external MCP servers for guga-codex.
     Mcp(McpCli),
 
-    /// Start gugugaga as an MCP server (stdio).
+    /// Start guga-codex as an MCP server (stdio).
     McpServer,
 
     /// [experimental] Run the app server or related tooling.
     AppServer(AppServerCommand),
 
-    /// Launch the gugugaga desktop app (downloads the macOS installer if missing).
+    /// Launch the guga-codex desktop app (downloads the macOS installer if missing).
     #[cfg(target_os = "macos")]
     App(app_cmd::AppCommand),
 
     /// Generate shell completion scripts.
     Completion(CompletionCommand),
 
-    /// Run commands within a gugugaga-provided sandbox.
+    /// Run commands within a guga-codex-provided sandbox.
     Sandbox(SandboxArgs),
 
     /// Debugging tools.
@@ -119,7 +119,7 @@ enum Subcommand {
     #[clap(hide = true)]
     Execpolicy(ExecpolicyCommand),
 
-    /// Apply the latest diff produced by gugugaga agent as a `git apply` to your local working tree.
+    /// Apply the latest diff produced by guga-codex agent as a `git apply` to your local working tree.
     #[clap(visible_alias = "a")]
     Apply(ApplyCommand),
 
@@ -260,7 +260,7 @@ struct LoginCommand {
 
     #[arg(
         long = "with-api-key",
-        help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | gugugaga login --with-api-key`)"
+        help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | guga-codex login --with-api-key`)"
     )]
     with_api_key: bool,
 
@@ -432,7 +432,7 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
 fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     println!();
     let cmd_str = action.command_str();
-    println!("Updating gugugaga via `{cmd_str}`...");
+    println!("Updating guga-codex via `{cmd_str}`...");
 
     let status = {
         #[cfg(windows)]
@@ -458,7 +458,7 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
     if !status.success() {
         anyhow::bail!("`{cmd_str}` failed with status {status}");
     }
-    println!("\n🎉 Update ran successfully! Please restart gugugaga.");
+    println!("\n🎉 Update ran successfully! Please restart guga-codex.");
     Ok(())
 }
 
@@ -684,7 +684,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                         .await;
                     } else if login_cli.api_key.is_some() {
                         eprintln!(
-                            "The --api-key flag is no longer supported. Pipe the key instead, e.g. `printenv OPENAI_API_KEY | gugugaga login --with-api-key`."
+                            "The --api-key flag is no longer supported. Pipe the key instead, e.g. `printenv OPENAI_API_KEY | guga-codex login --with-api-key`."
                         );
                         std::process::exit(1);
                     } else if login_cli.with_api_key {
@@ -906,7 +906,7 @@ async fn run_interactive_tui(
         }
 
         eprintln!(
-            "WARNING: TERM is set to \"dumb\". gugugaga's interactive TUI may not work in this terminal."
+            "WARNING: TERM is set to \"dumb\". guga-codex's interactive TUI may not work in this terminal."
         );
         if !confirm("Continue anyway? [y/N]: ")? {
             return Ok(AppExitInfo::fatal(
@@ -927,7 +927,7 @@ fn confirm(prompt: &str) -> std::io::Result<bool> {
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-/// Build the final `TuiCli` for a `gugugaga resume` invocation.
+/// Build the final `TuiCli` for a `guga-codex resume` invocation.
 fn finalize_resume_interactive(
     mut interactive: TuiCli,
     root_config_overrides: CliConfigOverrides,
@@ -937,7 +937,7 @@ fn finalize_resume_interactive(
     resume_cli: TuiCli,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so resume shares the same
-    // configuration surface area as `gugugaga` without additional flags.
+    // configuration surface area as `guga-codex` without additional flags.
     let resume_session_id = session_id;
     interactive.resume_picker = resume_session_id.is_none() && !last;
     interactive.resume_last = last;
@@ -953,7 +953,7 @@ fn finalize_resume_interactive(
     interactive
 }
 
-/// Build the final `TuiCli` for a `gugugaga fork` invocation.
+/// Build the final `TuiCli` for a `guga-codex fork` invocation.
 fn finalize_fork_interactive(
     mut interactive: TuiCli,
     root_config_overrides: CliConfigOverrides,
@@ -963,7 +963,7 @@ fn finalize_fork_interactive(
     fork_cli: TuiCli,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so fork shares the same
-    // configuration surface area as `gugugaga` without additional flags.
+    // configuration surface area as `guga-codex` without additional flags.
     let fork_session_id = session_id;
     interactive.fork_picker = fork_session_id.is_none() && !last;
     interactive.fork_last = last;
@@ -979,7 +979,7 @@ fn finalize_fork_interactive(
     interactive
 }
 
-/// Merge flags provided to `gugugaga resume`/`gugugaga fork` so they take precedence over any
+/// Merge flags provided to `guga-codex resume`/`guga-codex fork` so they take precedence over any
 /// root-level flags. Only overrides fields explicitly set on the subcommand-scoped
 /// CLI. Also appends `-c key=value` overrides with highest precedence.
 fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli) {
@@ -1029,7 +1029,7 @@ fn merge_interactive_cli_flags(interactive: &mut TuiCli, subcommand_cli: TuiCli)
 
 fn print_completion(cmd: CompletionCommand) {
     let mut app = MultitoolCli::command();
-    let name = "gugugaga";
+    let name = "guga-codex";
     generate(cmd.shell, &mut app, name, &mut std::io::stdout());
 }
 
@@ -1156,7 +1156,7 @@ mod tests {
             lines,
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run gugugaga resume 123e4567-e89b-12d3-a456-426614174000"
+                "To continue this session, run guga-codex resume 123e4567-e89b-12d3-a456-426614174000"
                     .to_string(),
             ]
         );
@@ -1181,7 +1181,7 @@ mod tests {
             lines,
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run gugugaga resume my-thread".to_string(),
+                "To continue this session, run guga-codex resume my-thread".to_string(),
             ]
         );
     }

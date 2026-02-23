@@ -25,13 +25,13 @@ pub(crate) enum CommandItem {
     Builtin(SlashCommand),
     // Index into `prompts`
     UserPrompt(usize),
-    Gugugaga(&'static str),
+    GugaCodex(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommandPopupMode {
     Slash,
-    Gugugaga,
+    GugaCodex,
 }
 
 pub(crate) struct CommandPopup {
@@ -50,12 +50,12 @@ pub(crate) struct CommandPopupFlags {
     pub(crate) windows_degraded_sandbox_active: bool,
 }
 
-const GUGUGAGA_COMMANDS: [(&str, &str); 5] = [
-    ("help", "Show Gugugaga help"),
-    ("clear", "Start a fresh Gugugaga session"),
+const GUGA_CODEX_COMMANDS: [(&str, &str); 5] = [
+    ("help", "Show GugaCodex help"),
+    ("clear", "Start a fresh GugaCodex session"),
     ("stats", "Show supervision status"),
-    ("model", "Open or set Gugugaga model"),
-    ("notebook", "Show Gugugaga notebook"),
+    ("model", "Open or set GugaCodex model"),
+    ("notebook", "Show GugaCodex notebook"),
 ];
 
 impl CommandPopup {
@@ -83,9 +83,9 @@ impl CommandPopup {
         }
     }
 
-    pub(crate) fn new_gugugaga() -> Self {
+    pub(crate) fn new_guga_codex() -> Self {
         Self {
-            mode: CommandPopupMode::Gugugaga,
+            mode: CommandPopupMode::GugaCodex,
             command_filter: String::new(),
             builtins: Vec::new(),
             prompts: Vec::new(),
@@ -129,7 +129,7 @@ impl CommandPopup {
                     token.split_whitespace().next().unwrap_or("").to_string()
                 })
                 .unwrap_or_default(),
-            CommandPopupMode::Gugugaga => first_line
+            CommandPopupMode::GugaCodex => first_line
                 .strip_prefix("//")
                 .map(|stripped| {
                     let token = stripped.trim_start();
@@ -157,7 +157,7 @@ impl CommandPopup {
     fn filtered(&self) -> Vec<(CommandItem, Option<Vec<usize>>)> {
         match self.mode {
             CommandPopupMode::Slash => self.filtered_slash(),
-            CommandPopupMode::Gugugaga => self.filtered_gugugaga(),
+            CommandPopupMode::GugaCodex => self.filtered_guga_codex(),
         }
     }
 
@@ -231,12 +231,12 @@ impl CommandPopup {
         out
     }
 
-    fn filtered_gugugaga(&self) -> Vec<(CommandItem, Option<Vec<usize>>)> {
+    fn filtered_guga_codex(&self) -> Vec<(CommandItem, Option<Vec<usize>>)> {
         let filter = self.command_filter.trim();
         let mut out: Vec<(CommandItem, Option<Vec<usize>>)> = Vec::new();
         if filter.is_empty() {
-            for (name, _) in GUGUGAGA_COMMANDS {
-                out.push((CommandItem::Gugugaga(name), None));
+            for (name, _) in GUGA_CODEX_COMMANDS {
+                out.push((CommandItem::GugaCodex(name), None));
             }
             return out;
         }
@@ -247,14 +247,14 @@ impl CommandPopup {
         let mut prefix: Vec<(CommandItem, Option<Vec<usize>>)> = Vec::new();
         let indices_for = || Some((0..filter_chars).collect());
 
-        for (name, _) in GUGUGAGA_COMMANDS {
+        for (name, _) in GUGA_CODEX_COMMANDS {
             let lower = name.to_lowercase();
             if lower == filter_lower {
-                exact.push((CommandItem::Gugugaga(name), indices_for()));
+                exact.push((CommandItem::GugaCodex(name), indices_for()));
                 continue;
             }
             if lower.starts_with(&filter_lower) {
-                prefix.push((CommandItem::Gugugaga(name), indices_for()));
+                prefix.push((CommandItem::GugaCodex(name), indices_for()));
             }
         }
 
@@ -292,9 +292,9 @@ impl CommandPopup {
                             1,
                         )
                     }
-                    CommandItem::Gugugaga(name) => (
+                    CommandItem::GugaCodex(name) => (
                         format!("//{name}"),
-                        gugugaga_command_description(name).to_string(),
+                        guga_codex_codex_command_description(name).to_string(),
                         2,
                     ),
                 };
@@ -337,18 +337,18 @@ impl CommandPopup {
     }
 }
 
-pub(crate) fn has_gugugaga_prefix(name: &str) -> bool {
+pub(crate) fn has_guga_prefix(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    GUGUGAGA_COMMANDS
+    GUGA_CODEX_COMMANDS
         .iter()
         .any(|(command, _)| command.starts_with(name.as_str()))
 }
 
-fn gugugaga_command_description(name: &str) -> &'static str {
-    GUGUGAGA_COMMANDS
+fn guga_codex_codex_command_description(name: &str) -> &'static str {
+    GUGA_CODEX_COMMANDS
         .iter()
         .find_map(|(command, description)| (*command == name).then_some(*description))
-        .unwrap_or("Gugugaga command")
+        .unwrap_or("GugaCodex command")
 }
 
 impl WidgetRef for CommandPopup {
@@ -383,7 +383,7 @@ mod tests {
         let has_init = matches.iter().any(|item| match item {
             CommandItem::Builtin(cmd) => cmd.command() == "init",
             CommandItem::UserPrompt(_) => false,
-            CommandItem::Gugugaga(_) => false,
+            CommandItem::GugaCodex(_) => false,
         });
         assert!(
             has_init,
@@ -402,7 +402,7 @@ mod tests {
         match selected {
             Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "init"),
             Some(CommandItem::UserPrompt(_)) => panic!("unexpected prompt selected for '/init'"),
-            Some(CommandItem::Gugugaga(_)) => panic!("unexpected gugugaga command for '/init'"),
+            Some(CommandItem::GugaCodex(_)) => panic!("unexpected guga-codex command for '/init'"),
             None => panic!("expected a selected command for exact match"),
         }
     }
@@ -417,8 +417,8 @@ mod tests {
             Some(CommandItem::UserPrompt(_)) => {
                 panic!("unexpected prompt ranked before '/model' for '/mo'")
             }
-            Some(CommandItem::Gugugaga(_)) => {
-                panic!("unexpected gugugaga command ranked before '/model' for '/mo'")
+            Some(CommandItem::GugaCodex(_)) => {
+                panic!("unexpected guga-codex command ranked before '/model' for '/mo'")
             }
             None => panic!("expected at least one match for '/mo'"),
         }
@@ -435,7 +435,7 @@ mod tests {
             .filter_map(|item| match item {
                 CommandItem::Builtin(cmd) => Some(cmd.command()),
                 CommandItem::UserPrompt(_) => None,
-                CommandItem::Gugugaga(_) => None,
+                CommandItem::GugaCodex(_) => None,
             })
             .collect();
         assert_eq!(cmds, vec!["model", "mention", "mcp"]);
@@ -544,7 +544,7 @@ mod tests {
             .filter_map(|item| match item {
                 CommandItem::Builtin(cmd) => Some(cmd.command()),
                 CommandItem::UserPrompt(_) => None,
-                CommandItem::Gugugaga(_) => None,
+                CommandItem::GugaCodex(_) => None,
             })
             .collect();
         assert!(
@@ -576,7 +576,7 @@ mod tests {
             .filter_map(|item| match item {
                 CommandItem::Builtin(cmd) => Some(cmd.command()),
                 CommandItem::UserPrompt(_) => None,
-                CommandItem::Gugugaga(_) => None,
+                CommandItem::GugaCodex(_) => None,
             })
             .collect();
         assert!(
@@ -646,7 +646,7 @@ mod tests {
             .filter_map(|item| match item {
                 CommandItem::Builtin(cmd) => Some(cmd.command()),
                 CommandItem::UserPrompt(_) => None,
-                CommandItem::Gugugaga(_) => None,
+                CommandItem::GugaCodex(_) => None,
             })
             .collect();
         assert!(
@@ -683,7 +683,7 @@ mod tests {
             .filter_map(|item| match item {
                 CommandItem::Builtin(cmd) => Some(cmd.command()),
                 CommandItem::UserPrompt(_) => None,
-                CommandItem::Gugugaga(_) => None,
+                CommandItem::GugaCodex(_) => None,
             })
             .collect();
 
@@ -694,16 +694,19 @@ mod tests {
     }
 
     #[test]
-    fn gugugaga_mode_prefers_help_for_bare_double_slash() {
-        let mut popup = CommandPopup::new_gugugaga();
+    fn guga_codex_codex_mode_prefers_help_for_bare_double_slash() {
+        let mut popup = CommandPopup::new_guga_codex();
         popup.on_composer_text_change("//".to_string());
-        assert_eq!(popup.selected_item(), Some(CommandItem::Gugugaga("help")));
+        assert_eq!(popup.selected_item(), Some(CommandItem::GugaCodex("help")));
     }
 
     #[test]
-    fn gugugaga_mode_filters_model_from_double_slash_prefix() {
-        let mut popup = CommandPopup::new_gugugaga();
+    fn guga_codex_codex_mode_filters_model_from_double_slash_prefix() {
+        let mut popup = CommandPopup::new_guga_codex();
         popup.on_composer_text_change("//mo".to_string());
-        assert_eq!(popup.filtered_items(), vec![CommandItem::Gugugaga("model")]);
+        assert_eq!(
+            popup.filtered_items(),
+            vec![CommandItem::GugaCodex("model")]
+        );
     }
 }
