@@ -1012,7 +1012,7 @@ fn run_issues_command(workspace_root: &std::path::Path, args: &IssuesArgs) -> an
             print!("{}", issues::prime_prompt());
         }
         IssuesCommand::Serve { host, port } => {
-            println!("serving http://{}:{}", host, port);
+            println!("serving http://{host}:{port}");
             issues::serve(&store, host, *port)?;
         }
         IssuesCommand::Create {
@@ -1157,7 +1157,7 @@ fn run_issues_command(workspace_root: &std::path::Path, args: &IssuesArgs) -> an
                 if args.json {
                     json_out!(issue);
                 } else {
-                    println!("added dependency {} -> {}", child, parent);
+                    println!("added dependency {child} -> {parent}");
                 }
             }
             DepCommand::Remove { child, parent } => {
@@ -1165,7 +1165,7 @@ fn run_issues_command(workspace_root: &std::path::Path, args: &IssuesArgs) -> an
                 if args.json {
                     json_out!(issue);
                 } else {
-                    println!("removed dependency {} -> {}", child, parent);
+                    println!("removed dependency {child} -> {parent}");
                 }
             }
         },
