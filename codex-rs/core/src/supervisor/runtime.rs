@@ -592,6 +592,7 @@ impl SupervisorRuntime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_supervisor_loop<F>(
         &self,
         turn_context: &TurnContext,
@@ -630,8 +631,7 @@ impl SupervisorRuntime {
             let history_excerpt = self
                 .build_recent_history_excerpt(history_excerpt_limit)
                 .await;
-            let prompt_text =
-                build_prompt_text(notebook_text.as_str(), history_excerpt.as_str());
+            let prompt_text = build_prompt_text(notebook_text.as_str(), history_excerpt.as_str());
 
             let mut input = vec![ResponseItem::Message {
                 id: None,
@@ -673,22 +673,15 @@ impl SupervisorRuntime {
             let mut completed = false;
 
             loop {
-                let maybe_event =
-                    tokio::time::timeout(SUPERVISOR_STREAM_TIMEOUT, stream.next())
-                        .await
-                        .map_err(|_| {
-                            format!("supervisor stream timed out in round {round}")
-                        })?;
+                let maybe_event = tokio::time::timeout(SUPERVISOR_STREAM_TIMEOUT, stream.next())
+                    .await
+                    .map_err(|_| format!("supervisor stream timed out in round {round}"))?;
                 let Some(event) = maybe_event else {
                     break;
                 };
 
-                match event
-                    .map_err(|err| format!("supervisor stream error: {err}"))?
-                {
-                    ResponseEvent::OutputTextDelta(delta) => {
-                        response_text.push_str(&delta)
-                    }
+                match event.map_err(|err| format!("supervisor stream error: {err}"))? {
+                    ResponseEvent::OutputTextDelta(delta) => response_text.push_str(&delta),
                     ResponseEvent::OutputItemDone(item) => {
                         if response_text.is_empty()
                             && let Some(text) = extract_response_item_text(&item)
@@ -740,6 +733,7 @@ impl SupervisorRuntime {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_structured_tool_calls_for_round(
         &self,
         turn_context: &TurnContext,
@@ -963,7 +957,7 @@ impl SupervisorRuntime {
         let notebook_path_display = notebook_path.to_string_lossy().replace('\\', "/");
         let mut changes = HashMap::new();
         changes.insert(
-            notebook_path.clone(),
+            notebook_path,
             FileChange::Update {
                 unified_diff: diff_body.to_string(),
                 move_path: None,
@@ -974,8 +968,7 @@ impl SupervisorRuntime {
             summary: summary.to_string(),
             changes,
             turn_diff: format!(
-                "diff --git a/{0} b/{0}\n--- a/{0}\n+++ b/{0}\n{1}",
-                notebook_path_display, diff_body
+                "diff --git a/{notebook_path_display} b/{notebook_path_display}\n--- a/{notebook_path_display}\n+++ b/{notebook_path_display}\n{diff_body}"
             ),
         })
     }
@@ -1084,8 +1077,12 @@ impl SupervisorRuntime {
                     #[serde(default = "read_file_default_limit")]
                     limit: usize,
                 }
-                fn read_file_default_offset() -> usize { 1 }
-                fn read_file_default_limit() -> usize { 100 }
+                fn read_file_default_offset() -> usize {
+                    1
+                }
+                fn read_file_default_limit() -> usize {
+                    100
+                }
 
                 let parsed: ReadFileArgs = serde_json::from_str(args)
                     .map_err(|e| format!("read_file: invalid args: {e}"))
@@ -1332,12 +1329,9 @@ impl SupervisorRuntime {
             }
         };
 
-        let completed =
-            Self::normalize_completed_items(root.get("completed"), now.clone(), &mut report);
-        let attention =
-            Self::normalize_attention_items(root.get("attention"), now.clone(), &mut report);
-        let mistakes =
-            Self::normalize_mistake_items(root.get("mistakes"), now.clone(), &mut report);
+        let completed = Self::normalize_completed_items(root.get("completed"), now, &mut report);
+        let attention = Self::normalize_attention_items(root.get("attention"), now, &mut report);
+        let mistakes = Self::normalize_mistake_items(root.get("mistakes"), now, &mut report);
 
         if !report.is_empty() {
             return Err(report);
@@ -1389,7 +1383,7 @@ impl SupervisorRuntime {
                 Self::require_string_field(item_obj, &item_path, "significance", report);
             if let (Some(what), Some(significance)) = (what, significance) {
                 out.push(CompletedItem {
-                    timestamp: now.clone(),
+                    timestamp: now,
                     what,
                     significance,
                 });
@@ -1439,7 +1433,7 @@ impl SupervisorRuntime {
                     content,
                     source,
                     priority,
-                    added_at: now.clone(),
+                    added_at: now,
                 });
             }
         }
@@ -1489,7 +1483,7 @@ impl SupervisorRuntime {
                 (what_happened, how_corrected, lesson)
             {
                 out.push(MistakeEntry {
-                    timestamp: now.clone(),
+                    timestamp: now,
                     what_happened,
                     how_corrected,
                     lesson,
@@ -2458,9 +2452,7 @@ fn glob_files_blocking(cwd: &Path, pattern: &str) -> Result<Vec<PathBuf>, String
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| matcher.matches(name));
 
-        if matcher.matches(rel_str.as_ref())
-            || matcher.matches(abs_str.as_ref())
-            || filename_match
+        if matcher.matches(rel_str.as_ref()) || matcher.matches(abs_str.as_ref()) || filename_match
         {
             matches.push(path.to_path_buf());
         }
@@ -3011,8 +3003,8 @@ mod tests {
             "last_updated": "2000-01-01T00:00:00Z"
         });
 
-        let notebook = SupervisorRuntime::normalize_notebook_value(&value, now.clone())
-            .expect("normalize notebook");
+        let notebook =
+            SupervisorRuntime::normalize_notebook_value(&value, now).expect("normalize notebook");
         assert_eq!(
             notebook.current_activity,
             Some("测试 notebook 写入".to_string())

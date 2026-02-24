@@ -3112,9 +3112,7 @@ impl ChatComposer {
         cursor: usize,
     ) -> Option<(&str, &str)> {
         let stripped = first_line.strip_prefix("//")?;
-        let name_end_in_stripped = stripped
-            .find(char::is_whitespace)
-            .unwrap_or_else(|| stripped.len());
+        let name_end_in_stripped = stripped.find(char::is_whitespace).unwrap_or(stripped.len());
         // `//` prefix is two bytes in ASCII.
         let name_end = 2 + name_end_in_stripped;
         if cursor > name_end {

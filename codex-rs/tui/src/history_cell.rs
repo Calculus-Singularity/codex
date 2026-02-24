@@ -938,6 +938,7 @@ struct NotebookUnifiedDiff {
     removed_lines: Vec<String>,
 }
 
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn new_notebook_patch_event(
     changes: &HashMap<PathBuf, FileChange>,
     cwd: &Path,
@@ -958,6 +959,7 @@ pub(crate) fn new_notebook_patch_event(
     Some(NotebookPatchHistoryCell { diff: semantic })
 }
 
+#[allow(clippy::disallowed_methods)]
 fn render_notebook_diff_lines(diff: &NotebookSemanticDiff) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
@@ -999,6 +1001,7 @@ fn truncate_or_empty(text: &str, max_graphemes: usize) -> String {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
 fn append_notebook_list_section(
     lines: &mut Vec<Line<'static>>,
     name: &str,
