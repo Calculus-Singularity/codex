@@ -889,7 +889,10 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 .await??;
         }
         Some(Subcommand::Issues(args)) => {
-            let cwd = interactive.cwd.as_deref().unwrap_or(std::path::Path::new("."));
+            let cwd = interactive
+                .cwd
+                .as_deref()
+                .unwrap_or(std::path::Path::new("."));
             let root = codex_core::issues::workspace_root(cwd)?;
             run_issues_command(&root, &args)?;
         }
@@ -972,11 +975,10 @@ async fn disable_feature_in_config(interactive: &TuiCli, feature: &str) -> anyho
     Ok(())
 }
 
-fn run_issues_command(
-    workspace_root: &std::path::Path,
-    args: &IssuesArgs,
-) -> anyhow::Result<()> {
-    use codex_core::issues::{self, CreateIssueInput, IssueStore, ListIssuesOptions, ListSort, UpdateIssueInput};
+fn run_issues_command(workspace_root: &std::path::Path, args: &IssuesArgs) -> anyhow::Result<()> {
+    use codex_core::issues::{
+        self, CreateIssueInput, IssueStore, ListIssuesOptions, ListSort, UpdateIssueInput,
+    };
 
     let store = IssueStore::new(workspace_root);
     let color = !args.no_color;
@@ -1159,8 +1161,7 @@ fn run_issues_command(
                 }
             }
             DepCommand::Remove { child, parent } => {
-                let issue =
-                    store.with_lock(args.force, |s| s.remove_dependency(child, parent))?;
+                let issue = store.with_lock(args.force, |s| s.remove_dependency(child, parent))?;
                 if args.json {
                     json_out!(issue);
                 } else {

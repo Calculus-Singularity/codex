@@ -3,7 +3,7 @@
 //! Storage format is JSONL in `.issues/issues.jsonl` so it stays compatible
 //! with existing issue data.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -248,9 +248,7 @@ impl IssueStore {
             }
         }
 
-        let guard = LockGuard {
-            path: lock_path.clone(),
-        };
+        let guard = LockGuard { path: lock_path };
         let result = operation(self);
         drop(guard);
         result
@@ -620,10 +618,7 @@ pub fn format_issue_details(issue: &Issue, color: bool) -> Vec<String> {
     if !issue.description.trim().is_empty() {
         lines.push(format!("description: {}", issue.description));
     }
-    lines.push(format!(
-        "status: {}",
-        colorize_status(&issue.status, color)
-    ));
+    lines.push(format!("status: {}", colorize_status(&issue.status, color)));
     lines.push(format!(
         "priority: {}",
         colorize(&issue.priority.to_string(), Ansi::Magenta, color)
@@ -681,7 +676,7 @@ fn colorize_status(status: &str, color: bool) -> String {
 pub fn serve(store: &IssueStore, host: &str, port: u16) -> Result<()> {
     store.ensure_workspace()?;
     let listener =
-        TcpListener::bind((host, port)).with_context(|| format!("bind {}:{}", host, port))?;
+        TcpListener::bind((host, port)).with_context(|| format!("bind {host}:{port}"))?;
 
     for stream_result in listener.incoming() {
         match stream_result {
@@ -810,10 +805,7 @@ fn render_issues_page(issues: &[Issue]) -> String {
         };
 
         html.push_str("<tr>");
-        html.push_str(&format!(
-            "<td><code>{}</code></td>",
-            escape_html(&issue.id)
-        ));
+        html.push_str(&format!("<td><code>{}</code></td>", escape_html(&issue.id)));
         html.push_str(&format!(
             "<td><span class=\"badge {}\">{}</span></td>",
             status_class,
@@ -960,7 +952,7 @@ fn would_create_cycle(issues: &[Issue], child: &str, parent: &str) -> bool {
     for issue in issues {
         deps_by_id.insert(
             issue.id.as_str(),
-            issue.deps.iter().map(|s| s.as_str()).collect(),
+            issue.deps.iter().map(String::as_str).collect(),
         );
     }
 
