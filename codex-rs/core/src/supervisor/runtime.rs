@@ -3129,7 +3129,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_prompt_keeps_notebook_memory_turn_order() {
+    fn supervisor_prompt_keeps_notebook_history_turn_order() {
         let prompt = build_supervisor_prompt(
             &[String::from("User asks for strict alignment")],
             "Codex completed the requested changes.",
@@ -3138,60 +3138,60 @@ mod tests {
         );
 
         let notebook_idx = prompt
-            .find("=== Your Notebook File (Persistent) ===")
+            .find("## Notebook (this session)")
             .expect("notebook section present");
-        let memory_idx = prompt
-            .find("=== Persistent Memory (Recent History) ===")
-            .expect("memory section present");
+        let history_idx = prompt
+            .find("## Conversation history (this session)")
+            .expect("history section present");
         let turn_idx = prompt
-            .find("=== Current Turn ===")
+            .find("## Current turn")
             .expect("current turn section present");
 
-        assert!(notebook_idx < memory_idx);
-        assert!(memory_idx < turn_idx);
+        assert!(notebook_idx < history_idx);
+        assert!(history_idx < turn_idx);
         assert!(prompt.contains("User:\nUser asks for strict alignment"));
-        assert!(prompt.contains("Codex Output:\nCodex completed the requested changes."));
+        assert!(prompt.contains("Codex output:\nCodex completed the requested changes."));
     }
 
     #[test]
-    fn supervisor_prompt_preserves_old_instruction_style() {
+    fn supervisor_prompt_contains_key_instructions() {
         let prompt = build_supervisor_prompt(&[String::from("x")], "y", "{}", "(no history yet)");
 
-        assert!(prompt.contains(
-            "Judge if behavior is reasonable **given the user's specific instructions and preferences**"
-        ));
-        assert!(prompt.contains("Before deciding, read notebook content with `read_notebook`."));
-        assert!(prompt.contains("If no violation (this should be your answer ~90% of the time):"));
-        assert!(prompt.contains(
-            "Valid violation types: FALLBACK, IGNORED_INSTRUCTION, UNAUTHORIZED_CHANGE, UNNECESSARY_INTERACTION, OVER_ENGINEERING, BYPASSED_ISSUE_TRACKER"
-        ));
+        assert!(prompt.contains("Judge if behavior is reasonable given the user's specific instructions and preferences."));
+        assert!(prompt.contains("read notebook content with `read_notebook`"));
+        assert!(prompt.contains("No violation (this should be your answer ~90% of the time):"));
+        assert!(prompt.contains("`FALLBACK`"));
+        assert!(prompt.contains("`BYPASSED_ISSUE_TRACKER`"));
+        assert!(prompt.contains("scoped to this session only"));
     }
 
     #[test]
-    fn supervisor_chat_prompt_keeps_notebook_memory_user_order() {
+    fn supervisor_chat_prompt_keeps_notebook_history_user_order() {
         let prompt = build_supervisor_chat_prompt(
             "为什么你要这样判断？",
             "{\"current_activity\":\"reviewing\"}",
             "#0 [codex] prior",
         );
         let notebook_idx = prompt
-            .find("=== Your Notebook File (Persistent) ===")
+            .find("## Notebook (this session)")
             .expect("notebook section present");
-        let memory_idx = prompt
-            .find("=== Persistent Memory (Recent History) ===")
-            .expect("memory section present");
-        let user_idx = prompt.find("User message:").expect("user section present");
+        let history_idx = prompt
+            .find("## Conversation history (this session)")
+            .expect("history section present");
+        let user_idx = prompt
+            .find("# User message")
+            .expect("user section present");
 
-        assert!(notebook_idx < memory_idx);
-        assert!(memory_idx < user_idx);
+        assert!(notebook_idx < history_idx);
+        assert!(history_idx < user_idx);
         assert!(prompt.contains("为什么你要这样判断？"));
     }
 
     #[test]
-    fn supervisor_chat_prompt_mentions_structured_tools() {
+    fn supervisor_chat_prompt_mentions_tools() {
         let prompt = build_supervisor_chat_prompt("status?", "n", "h");
-        assert!(prompt.contains("Use structured tools when needed"));
-        assert!(prompt.contains("- read_notebook"));
-        assert!(prompt.contains("- apply_patch_notebook"));
+        assert!(prompt.contains("`read_notebook`"));
+        assert!(prompt.contains("`apply_patch_notebook`"));
+        assert!(prompt.contains("scoped to this session only"));
     }
 }
