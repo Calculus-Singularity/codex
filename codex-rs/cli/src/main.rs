@@ -55,7 +55,7 @@ use codex_core::terminal::TerminalName;
 #[derive(Debug, Parser)]
 #[clap(
     author,
-    version,
+    version = "0.1.2",
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform‑specific name like
