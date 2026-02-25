@@ -22,23 +22,21 @@ pub const STATUS_BLOCKED: &str = "blocked";
 pub const STATUS_CLOSED: &str = "closed";
 
 const ONBOARD_SECTION: &str = "\
-## Guga-Codex Issues
+## Issue Tracking
 
-This project uses `guga-codex issues` for issue tracking.
+Do NOT use built-in TodoWrite or task management tools for tracking work.
+Use an external issue tracker instead. This project has `guga-codex issues` available.
 Run `guga-codex issues prime` for workflow context.
-
-**Important**: Do NOT use your built-in TodoWrite or task management tools.
-All task tracking must go through `guga-codex issues` commands.
+If the project also uses beads or another tracker, that is acceptable too.
 ";
 
 const ONBOARD_FILE: &str = "\
 # AGENTS.md
 
-This project uses `guga-codex issues` for issue tracking.
+Do NOT use built-in TodoWrite or task management tools for tracking work.
+Use an external issue tracker instead. This project has `guga-codex issues` available.
 Run `guga-codex issues prime` for workflow context.
-
-**Important**: Do NOT use your built-in TodoWrite or task management tools.
-All task tracking must go through `guga-codex issues` commands.
+If the project also uses beads or another tracker, that is acceptable too.
 ";
 
 const PRIME_PROMPT: &str = "\
@@ -64,7 +62,7 @@ Notes:
 - `list` hides closed by default; add `--all` to include them.
 - If lock is stale, retry with `--force`.
 - Do not read or edit issue storage directly; use `guga-codex issues` commands.
-- Do NOT use built-in TodoWrite or task management; use `guga-codex issues` exclusively.
+- Do NOT use built-in TodoWrite or task management. Use `guga-codex issues` or another external tracker (e.g. beads).
 ";
 
 fn default_status() -> String {
@@ -552,7 +550,11 @@ pub fn ensure_agents_doc(root: &Path) -> Result<Option<String>> {
         let content =
             fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
 
-        if content.contains("guga-codex issues") {
+        if content.contains("guga-codex issues")
+            || content.contains("bd ready")
+            || content.contains("bd create")
+            || content.contains("beads")
+        {
             return Ok(None);
         }
 
