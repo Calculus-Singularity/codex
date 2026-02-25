@@ -50,12 +50,13 @@ pub(crate) struct CommandPopupFlags {
     pub(crate) windows_degraded_sandbox_active: bool,
 }
 
-const GUGA_CODEX_COMMANDS: [(&str, &str); 5] = [
+const GUGA_CODEX_COMMANDS: [(&str, &str); 6] = [
     ("help", "Show GugaCodex help"),
     ("clear", "Start a fresh GugaCodex session"),
     ("stats", "Show supervision status"),
     ("model", "Open or set GugaCodex model"),
     ("notebook", "Show GugaCodex notebook"),
+    ("toggle", "Toggle supervisor on/off"),
 ];
 
 impl CommandPopup {

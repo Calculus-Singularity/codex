@@ -205,6 +205,9 @@ pub enum Op {
         message: String,
     },
 
+    /// Toggle the GugaCodex supervisor on or off at runtime.
+    SupervisorToggle,
+
     /// Override parts of the persistent turn context for subsequent turns.
     ///
     /// All fields are optional; when omitted, the existing value is preserved.

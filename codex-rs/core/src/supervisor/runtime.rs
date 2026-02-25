@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -238,7 +240,7 @@ pub(crate) struct SupervisorChatOutcome {
 }
 
 pub(crate) struct SupervisorRuntime {
-    enabled: bool,
+    enabled: AtomicBool,
     notebook_path: Option<PathBuf>,
     history_archive_path: Option<PathBuf>,
     notebook: Mutex<SupervisorNotebook>,
@@ -254,7 +256,7 @@ impl SupervisorRuntime {
     async fn new(codex_home: &Path, conversation_id: ThreadId, enabled: bool) -> Self {
         if !enabled {
             return Self {
-                enabled,
+                enabled: AtomicBool::new(false),
                 notebook_path: None,
                 history_archive_path: None,
                 notebook: Mutex::new(SupervisorNotebook::default()),
@@ -273,7 +275,7 @@ impl SupervisorRuntime {
         let notebook = load_notebook(&notebook_path).await.unwrap_or_default();
 
         Self {
-            enabled,
+            enabled: AtomicBool::new(enabled),
             notebook_path: Some(notebook_path),
             history_archive_path: Some(history_archive_path),
             notebook: Mutex::new(notebook),
@@ -282,7 +284,17 @@ impl SupervisorRuntime {
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.enabled
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_enabled(&self, val: bool) {
+        self.enabled.store(val, Ordering::Relaxed);
+    }
+
+    /// Toggle supervisor on/off and return the new state.
+    pub(crate) fn toggle(&self) -> bool {
+        let prev = self.enabled.fetch_xor(true, Ordering::Relaxed);
+        !prev
     }
 
     #[allow(dead_code)]
@@ -305,7 +317,7 @@ impl SupervisorRuntime {
         turn_context: Option<&TurnContext>,
         model_client: Option<&ModelClient>,
     ) -> Option<SupervisorAfterAgentOutcome> {
-        if !self.enabled {
+        if !self.enabled() {
             return None;
         }
 
@@ -481,7 +493,7 @@ impl SupervisorRuntime {
         turn_id: &str,
         response: &RequestUserInputResponse,
     ) -> Option<String> {
-        if !self.enabled {
+        if !self.enabled() {
             return None;
         }
 
@@ -506,7 +518,7 @@ impl SupervisorRuntime {
         turn_context: &TurnContext,
         model_client: &ModelClient,
     ) -> Result<SupervisorChatOutcome, String> {
-        if !self.enabled {
+        if !self.enabled() {
             return Err("supervisor is disabled".to_string());
         }
 

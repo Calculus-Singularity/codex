@@ -3410,6 +3410,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::SupervisorChat { message } => {
                 handlers::supervisor_chat(&sess, sub.id.clone(), message).await;
             }
+            Op::SupervisorToggle => {
+                handlers::supervisor_toggle(&sess, sub.id.clone()).await;
+            }
             Op::ExecApproval {
                 id: approval_id,
                 turn_id,
@@ -3746,6 +3749,20 @@ mod handlers {
                 .await;
             }
         }
+    }
+
+    pub async fn supervisor_toggle(sess: &Arc<Session>, sub_id: String) {
+        let new_state = sess.services.supervisor.toggle();
+        let message = if new_state {
+            "GugaCodex supervisor enabled.".to_string()
+        } else {
+            "GugaCodex supervisor disabled.".to_string()
+        };
+        sess.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::Warning(WarningEvent { message }),
+        })
+        .await;
     }
 
     pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command: String) {

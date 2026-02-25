@@ -738,6 +738,7 @@ enum GugaCodexCommand {
     Stats,
     Model,
     Notebook,
+    Toggle,
 }
 
 impl GugaCodexCommand {
@@ -748,6 +749,7 @@ impl GugaCodexCommand {
             GugaCodexCommand::Stats,
             GugaCodexCommand::Model,
             GugaCodexCommand::Notebook,
+            GugaCodexCommand::Toggle,
         ]
     }
 
@@ -758,6 +760,7 @@ impl GugaCodexCommand {
             GugaCodexCommand::Stats => "stats",
             GugaCodexCommand::Model => "model",
             GugaCodexCommand::Notebook => "notebook",
+            GugaCodexCommand::Toggle => "toggle",
         }
     }
 
@@ -768,6 +771,7 @@ impl GugaCodexCommand {
             GugaCodexCommand::Stats => "Show supervision status",
             GugaCodexCommand::Model => "Open or set GugaCodex model",
             GugaCodexCommand::Notebook => "Show GugaCodex notebook",
+            GugaCodexCommand::Toggle => "Toggle supervisor on/off",
         }
     }
 
@@ -3609,6 +3613,9 @@ impl ChatWidget {
                         notebook_path.display()
                     )),
                 }
+            }
+            GugaCodexCommand::Toggle => {
+                self.submit_op(Op::SupervisorToggle);
             }
         }
     }
