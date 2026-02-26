@@ -5218,6 +5218,7 @@ pub(crate) async fn run_turn(
                         return None;
                     }
                     let mut queued_supervisor_follow_up = false;
+                    let in_plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
                     if sess.services.supervisor.enabled() {
                         sess.notify_background_event(
                             &turn_context,
@@ -5252,38 +5253,46 @@ pub(crate) async fn run_turn(
                                     )
                                     .await;
                                 }
-                                if let Some(message) = outcome.correction_user_message {
-                                    sess.send_event(
-                                        &turn_context,
-                                        EventMsg::AgentMessage(AgentMessageEvent {
-                                            message,
-                                            phase: Some(MessagePhase::Commentary),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                if let Some(correction) = outcome.correction_to_codex {
-                                    let injected = sess
-                                        .steer_input(
-                                            vec![UserInput::Text {
-                                                text: correction,
-                                                text_elements: Vec::new(),
-                                            }],
-                                            Some(turn_context.sub_id.as_str()),
+                                if in_plan_mode {
+                                    if outcome.correction_to_codex.is_some() {
+                                        info!(
+                                            "Supervisor correction suppressed in Plan mode to avoid overriding plan output"
+                                        );
+                                    }
+                                } else {
+                                    if let Some(message) = outcome.correction_user_message {
+                                        sess.send_event(
+                                            &turn_context,
+                                            EventMsg::AgentMessage(AgentMessageEvent {
+                                                message,
+                                                phase: Some(MessagePhase::Commentary),
+                                            }),
                                         )
                                         .await;
-                                    match injected {
-                                        Ok(_) => {
-                                            queued_supervisor_follow_up = true;
-                                        }
-                                        Err(_) => {
-                                            sess.send_event(
-                                                &turn_context,
-                                                EventMsg::Warning(WarningEvent {
-                                                    message: "guga-codex supervisor correction was generated but could not be queued".to_string(),
-                                                }),
+                                    }
+                                    if let Some(correction) = outcome.correction_to_codex {
+                                        let injected = sess
+                                            .steer_input(
+                                                vec![UserInput::Text {
+                                                    text: correction,
+                                                    text_elements: Vec::new(),
+                                                }],
+                                                Some(turn_context.sub_id.as_str()),
                                             )
                                             .await;
+                                        match injected {
+                                            Ok(_) => {
+                                                queued_supervisor_follow_up = true;
+                                            }
+                                            Err(_) => {
+                                                sess.send_event(
+                                                    &turn_context,
+                                                    EventMsg::Warning(WarningEvent {
+                                                        message: "guga-codex supervisor correction was generated but could not be queued".to_string(),
+                                                    }),
+                                                )
+                                                .await;
+                                            }
                                         }
                                     }
                                 }
