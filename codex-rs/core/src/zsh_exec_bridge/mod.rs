@@ -360,13 +360,16 @@ impl ZshExecBridge {
                 approval_reason,
                 None,
                 None::<ExecPolicyAmendment>,
+                None,
+                None,
             )
             .await;
 
         let (action, reason, user_rejected) = match decision {
             ReviewDecision::Approved
             | ReviewDecision::ApprovedForSession
-            | ReviewDecision::ApprovedExecpolicyAmendment { .. } => {
+            | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+            | ReviewDecision::NetworkPolicyAmendment { .. } => {
                 (WrapperExecAction::Run, None, false)
             }
             ReviewDecision::Denied => (

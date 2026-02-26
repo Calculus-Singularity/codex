@@ -1,5 +1,6 @@
 use crate::codex::TurnContext;
 use crate::environment_context::EnvironmentContext;
+use crate::features::Feature;
 use crate::shell::Shell;
 use codex_execpolicy::Policy;
 use codex_protocol::config_types::Personality;
@@ -31,16 +32,19 @@ fn build_permissions_update_item(
     exec_policy: &Policy,
 ) -> Option<ResponseItem> {
     let prev = previous?;
-    if prev.sandbox_policy == next.sandbox_policy && prev.approval_policy == next.approval_policy {
+    if prev.sandbox_policy == *next.sandbox_policy.get()
+        && prev.approval_policy == next.approval_policy.value()
+    {
         return None;
     }
 
     Some(
         DeveloperInstructions::from_policy(
-            &next.sandbox_policy,
-            next.approval_policy,
+            next.sandbox_policy.get(),
+            next.approval_policy.value(),
             exec_policy,
             &next.cwd,
+            next.features.enabled(Feature::RequestPermissions),
         )
         .into(),
     )

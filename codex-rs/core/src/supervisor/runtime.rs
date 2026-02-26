@@ -3178,9 +3178,7 @@ mod tests {
         let history_idx = prompt
             .find("## Conversation history (this session)")
             .expect("history section present");
-        let user_idx = prompt
-            .find("# User message")
-            .expect("user section present");
+        let user_idx = prompt.find("# User message").expect("user section present");
 
         assert!(notebook_idx < history_idx);
         assert!(history_idx < user_idx);
