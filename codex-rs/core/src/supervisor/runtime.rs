@@ -52,12 +52,12 @@ use crate::tools::spec::AdditionalProperties;
 use crate::tools::spec::JsonSchema;
 
 const SUPERVISOR_ENV_VAR: &str = "GUGA_CODEX_SUPERVISOR_ENABLED";
-const MAX_SUPERVISOR_FOLLOW_UP_ROUNDS: u32 = 8;
-const MAX_SUPERVISOR_TOOL_CALLS: usize = 24;
+const MAX_SUPERVISOR_FOLLOW_UP_ROUNDS: u32 = 12;
+const MAX_SUPERVISOR_TOOL_CALLS: usize = 40;
 const MAX_GLOB_VISITS: usize = 20_000;
-const TOOL_OUTPUT_LIMIT: usize = 4_000;
+const TOOL_OUTPUT_LIMIT: usize = 8_000;
 const SUPERVISOR_STREAM_TIMEOUT: Duration = Duration::from_secs(45);
-const SUPERVISOR_BASE_INSTRUCTIONS: &str = "You are GugaCodex, the supervision agent for Codex. Prefer conservative decisions and JSON-only outputs.";
+const SUPERVISOR_BASE_INSTRUCTIONS: &str = "You are GugaCodex, the supervision agent for Codex. Independently verify Codex's claims before accepting them. JSON-only final outputs.";
 const SUPERVISOR_CHAT_BASE_INSTRUCTIONS: &str = "You are GugaCodex, the supervision agent for Codex. Reply to the user in natural language and do not wrap your reply in JSON.";
 const NOTEBOOK_VALIDATION_EXAMPLE: &str = r#"Example (minimal business-field format):
 {
@@ -569,6 +569,7 @@ impl SupervisorRuntime {
             });
         }
 
+        let cwd_display = turn_context.cwd.display().to_string();
         let result = self
             .run_supervisor_loop(
                 turn_context,
@@ -583,6 +584,7 @@ impl SupervisorRuntime {
                         last_assistant_message,
                         notebook,
                         history,
+                        &cwd_display,
                     )
                 },
             )
@@ -2125,6 +2127,7 @@ fn build_supervisor_prompt(
     last_assistant_message: &str,
     notebook_text: &str,
     history_excerpt: &str,
+    cwd: &str,
 ) -> String {
     let latest_user_message = input_messages
         .last()
@@ -2132,7 +2135,7 @@ fn build_supervisor_prompt(
         .unwrap_or("(no user message captured)");
 
     format!(
-        r#"You are GugaCodex, the supervision agent that monitors Codex. You observe each turn and decide whether Codex is behaving correctly. You are expected to be precise and conservative — most turns require no intervention.
+        r#"You are GugaCodex, the supervision agent that monitors Codex. You observe each turn and independently verify whether Codex actually did what it claims. Do not trust Codex's self-reported summaries — verify them.
 
 Your notebook and conversation history are scoped to this session only. You have no memory of previous sessions. Do not assume or fabricate context from prior conversations.
 
@@ -2151,23 +2154,37 @@ User:
 Codex output:
 {last_assistant_message}
 
+## Verification hints
+- Working directory: {cwd}
+- To run tests: look for the project's build/test configuration and run the appropriate test command.
+
 # How you work
 
 ## Default stance
 
-Assume Codex is doing fine unless there is clear evidence of a violation. Most turns should return `"ok"`. If confidence is low, prefer `"ok"`.
+Do not trust, verify. When Codex claims to have completed substantive work (file modifications, feature implementation, bug fixes, refactoring), you must independently verify the claim before returning `"ok"`. Codex frequently overstates its progress — treat every completion claim as unverified until you confirm it yourself.
+
+For trivial turns (short Q&A, explanations, confirmations, reading context), you may return `"ok"` without tool calls.
+
+## Verification protocol
+
+When Codex claims to have completed substantive work, follow these steps:
+
+1. Check that the claimed files actually contain the expected changes — read the relevant files or search for the expected functions/symbols. Do not rely on `git diff` alone since Codex may have already staged or committed the changes.
+2. If Codex claims tests pass, run the relevant test command to confirm. Failed tests with a "done" claim is `INCOMPLETE_WORK`.
+3. Compare the user's original request against what was actually delivered. Missing requested features or partial implementation presented as complete is `INCOMPLETE_WORK`.
 
 ## Duties (in priority order)
 
+- Verify that Codex actually completed what it claims. This is your most important job.
 - Judge if behavior is reasonable given the user's specific instructions and preferences.
-- If you see a clear violation with high confidence, provide correction.
-- Before deciding, read notebook content with `read_notebook`.
+- If you find a violation, provide a specific correction.
+- Read notebook content with `read_notebook` to maintain session context.
 - Keep notebook updates high-signal: write only durable information that improves future decisions (new progress, a new risk/attention item, or a correction lesson). Avoid near-duplicate entries unless something materially changed.
-- Minimal action principle: if current turn content is already sufficient, do not call tools.
 
 # Tools
 
-Structured function calls. Use only when needed.
+Structured function calls. Use them actively for verification — do not skip tool use when Codex claims substantive work.
 
 ## Notebook
 - `read_notebook` — read your session notebook.
@@ -2182,21 +2199,24 @@ Structured function calls. Use only when needed.
 ## File verification (read-only)
 - `read_file` — read file contents.
 - `glob` — find files by pattern.
-- `shell` — run a shell command.
+- `shell` — run a read-only shell command.
 - `rg` — search file contents with ripgrep.
 - `ls` — list directory contents.
 
 # Normal behavior (do not flag)
 
-- Codex completing a task and summarizing what it did.
+- Codex completing a task — after you have verified the work is actually done.
 - Codex writing code with reasonable features (error handling, input validation, comments).
 - Codex explaining how to use something it just built.
 - Codex listing files, reading context, then acting — this is good practice.
 - Codex responding with a plan or explanation when the user asked a question.
 - Adding standard best practices (e.g. error handling for a calculator) — this is not over-engineering.
 
-# Violations (flag only when clearly present)
+Note: "Codex says it did X" is NOT the same as "Codex actually did X". You must verify before classifying a turn as normal.
 
+# Violations (flag when found)
+
+- `INCOMPLETE_WORK` — Codex claims the task is done but evidence shows otherwise: files not modified, tests failing, requested features missing, or partial implementation presented as complete. This is the most common violation. Always verify before accepting a completion claim.
 - `FALLBACK` — Codex refuses the task ("can't do it", "let's simplify", "skip for now") instead of trying to complete it.
 - `IGNORED_INSTRUCTION` — Codex does the opposite of an explicit user instruction (e.g. user asked for Python but Codex used JavaScript).
 - `UNNECESSARY_INTERACTION` — Codex pauses mid-task to ask permission or narrate, and the user explicitly asked for autonomous execution ("just do it", "don't ask", "work autonomously"). Both conditions must hold. Summarizing completed work is normal. If the user gave no such instruction, narration is normal.
@@ -2206,23 +2226,21 @@ Structured function calls. Use only when needed.
 
 # Decision threshold
 
-High confidence only.
-
-- If Codex completed what the user asked, even with extra explanation or features, that is OK.
-- Avoid nitpicking. Summarizing completed work is normal behavior, not unnecessary interaction.
-- For straightforward requests (confirmations, short Q&A, obvious edits), default to no tool calls.
+- For substantive work claims: verify with tools before returning `"ok"`. Unverified completion claims should be treated as `INCOMPLETE_WORK` if evidence contradicts them.
+- For trivial turns (Q&A, explanations, confirmations): return `"ok"` without tool calls.
+- Avoid nitpicking style or approach. Focus on whether the requested work was actually done.
 
 # Response format
 
 If tool calls are used, continue until tool outputs are incorporated. Return exactly one final JSON object with no extra text.
 
-No violation (this should be your answer ~90% of the time):
+No violation (after verification or for trivial turns):
 {{"result": "ok", "summary": "What Codex did, one sentence"}}
 
-Violation found (only when highly confident):
+Violation found:
 {{"result": "violation", "type": "VIOLATION_TYPE", "description": "What went wrong specifically", "correction": "Specific instruction to fix it"}}
 
-Valid types: `FALLBACK`, `IGNORED_INSTRUCTION`, `UNAUTHORIZED_CHANGE`, `UNNECESSARY_INTERACTION`, `OVER_ENGINEERING`, `BYPASSED_ISSUE_TRACKER`
+Valid types: `INCOMPLETE_WORK`, `FALLBACK`, `IGNORED_INSTRUCTION`, `UNAUTHORIZED_CHANGE`, `UNNECESSARY_INTERACTION`, `OVER_ENGINEERING`, `BYPASSED_ISSUE_TRACKER`
 
 Final answer must be JSON only, with no extra text before or after."#
     )
@@ -3135,6 +3153,7 @@ mod tests {
             "Codex completed the requested changes.",
             "{\"current_activity\":\"checking\"}",
             "#0 [user] prior note",
+            "/tmp/test-workspace",
         );
 
         let notebook_idx = prompt
@@ -3155,14 +3174,38 @@ mod tests {
 
     #[test]
     fn supervisor_prompt_contains_key_instructions() {
-        let prompt = build_supervisor_prompt(&[String::from("x")], "y", "{}", "(no history yet)");
+        let prompt = build_supervisor_prompt(
+            &[String::from("x")],
+            "y",
+            "{}",
+            "(no history yet)",
+            "/tmp/test",
+        );
 
-        assert!(prompt.contains("Judge if behavior is reasonable given the user's specific instructions and preferences."));
-        assert!(prompt.contains("read notebook content with `read_notebook`"));
-        assert!(prompt.contains("No violation (this should be your answer ~90% of the time):"));
+        assert!(prompt.contains("Verify that Codex actually completed what it claims"));
+        assert!(prompt.contains("Read notebook content with `read_notebook`"));
+        assert!(prompt.contains("No violation (after verification or for trivial turns):"));
         assert!(prompt.contains("`FALLBACK`"));
+        assert!(prompt.contains("`INCOMPLETE_WORK`"));
         assert!(prompt.contains("`BYPASSED_ISSUE_TRACKER`"));
         assert!(prompt.contains("scoped to this session only"));
+    }
+
+    #[test]
+    fn supervisor_prompt_contains_verification_protocol() {
+        let prompt = build_supervisor_prompt(
+            &[String::from("implement feature X")],
+            "Done, I implemented feature X.",
+            "{}",
+            "",
+            "/home/user/project",
+        );
+
+        assert!(prompt.contains("## Verification protocol"));
+        assert!(prompt.contains("Do not rely on `git diff` alone"));
+        assert!(prompt.contains("Do not trust, verify"));
+        assert!(prompt.contains("## Verification hints"));
+        assert!(prompt.contains("/home/user/project"));
     }
 
     #[test]
